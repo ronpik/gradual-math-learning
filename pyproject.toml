@@ -1,0 +1,13 @@
+[tool.uv.workspace]
+members = ["packages/*"]
+
+# Optional tooling, not part of the app runtime.
+# `scripts/plot_curves.py` renders the spec's formula figures.
+# Default `uv sync` stays lean/offline; bring these in with:
+#     uv sync --group plots
+[dependency-groups]
+plots = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "seaborn>=0.13",
+]
