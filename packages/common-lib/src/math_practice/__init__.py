@@ -12,6 +12,7 @@ from .engine import PracticeEngine, TrialResult
 from .mastery import MasteryState, MasteryTracker
 from .models import Exercise, build_curriculum
 from .selection import SelectionPolicy
+from .state import EngineState, ExerciseMastery
 
 __version__ = "0.1.0"
 
@@ -27,4 +28,6 @@ __all__ = [
     "MasteryTracker",
     "PracticeEngine",
     "TrialResult",
+    "EngineState",
+    "ExerciseMastery",
 ]

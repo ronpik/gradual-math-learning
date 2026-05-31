@@ -8,6 +8,7 @@ updates the latent ability, and tracks mastery progress.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ from .difficulty import AdditionFixedDifficultyScorer, DifficultyScorer
 from .mastery import MasteryState, MasteryTracker
 from .models import Exercise, build_curriculum
 from .selection import SelectionPolicy
+from .state import EngineState, ExerciseMastery
 
 
 @dataclass
@@ -145,6 +147,84 @@ class PracticeEngine:
             theta_after=theta_after,
             mastery=mastery,
         )
+
+    def snapshot(self) -> EngineState:
+        """Capture the full mutable engine state as an :class:`EngineState` (spec v1).
+
+        The returned snapshot is self-contained: it holds a *copy* of the
+        configuration, the latent ability, every exercise's mastery state, and
+        the last-shown exercise as ``(a, b)``. It shares no mutable references
+        with this engine, so later mutations here do not affect the snapshot.
+
+        Returns:
+            An :class:`EngineState` suitable for persistence and later
+            reconstruction via :meth:`from_state`.
+        """
+        mastery = [
+            ExerciseMastery(
+                a=exercise.a,
+                b=exercise.b,
+                streak=state.streak,
+                faults=state.faults,
+                mastered=state.mastered,
+            )
+            for exercise, state in self._mastery.items()
+        ]
+        last_shown = (
+            None
+            if self._last_shown is None
+            else (self._last_shown.a, self._last_shown.b)
+        )
+        return EngineState(
+            theta=self.theta,
+            config=dataclasses.replace(self.config),
+            mastery=mastery,
+            last_shown=last_shown,
+        )
+
+    @classmethod
+    def from_state(
+        cls, state: EngineState, rng: random.Random | None = None
+    ) -> "PracticeEngine":
+        """Rebuild a behaviourally identical engine from a snapshot (spec v1).
+
+        Reconstructs the curriculum from ``state.config``, restores the latent
+        ability, every exercise's mastery state, and the last-shown exercise.
+        The resulting engine behaves exactly like a live one: ``next_exercise``
+        excludes ``last_shown`` and ``submit`` continues updating the restored
+        ability and mastery.
+
+        Args:
+            state: a previously captured :class:`EngineState`.
+            rng:   random source for selection; defaults to a fresh
+                :class:`random.Random`.
+
+        Returns:
+            A fully working :class:`PracticeEngine`.
+        """
+        engine = cls(config=state.config, rng=rng)
+
+        # Restore the latent ability (both the tracker and the mirror).
+        engine._ability.theta = state.theta
+        engine.theta = state.theta
+
+        # Restore mastery, keyed by exercise operands.
+        restored: dict[Exercise, MasteryState] = {
+            Exercise(a=item.a, b=item.b): MasteryState(
+                streak=item.streak,
+                faults=item.faults,
+                mastered=item.mastered,
+            )
+            for item in state.mastery
+        }
+        engine._mastery.load_states(restored)
+
+        # Restore the exclusion target for the next draw.
+        if state.last_shown is not None:
+            a, b = state.last_shown
+            engine._last_shown = Exercise(a=a, b=b)
+
+        return engine
 
     def mastered_count(self) -> int:
         """Return the number of mastered exercises (delegates to the tracker)."""

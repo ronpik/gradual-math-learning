@@ -96,6 +96,29 @@ class MasteryTracker:
 
         return state
 
+    def load_states(self, states: dict[Exercise, MasteryState]) -> None:
+        """Overwrite tracked mastery states from a saved mapping (spec v1, restore).
+
+        Used by :meth:`math_practice.engine.PracticeEngine.from_state` to rebuild
+        a tracker from a persisted snapshot. Only exercises present in both the
+        current curriculum and ``states`` are updated; the existing fresh state
+        is kept for any exercise not mentioned in ``states``.
+
+        Args:
+            states: mapping from :class:`Exercise` to the mastery state to apply.
+        """
+        for exercise, state in states.items():
+            if exercise in self._states:
+                self._states[exercise] = state
+
+    def items(self) -> list[tuple[Exercise, MasteryState]]:
+        """Return ``(exercise, state)`` pairs for every tracked exercise.
+
+        The order follows the curriculum order the tracker was built with.
+        Used by :meth:`math_practice.engine.PracticeEngine.snapshot`.
+        """
+        return list(self._states.items())
+
     def state(self, exercise: Exercise) -> MasteryState:
         """Return the current :class:`MasteryState` for ``exercise``."""
         return self._states[exercise]
