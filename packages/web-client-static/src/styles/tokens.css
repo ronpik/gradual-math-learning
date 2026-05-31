@@ -1,0 +1,142 @@
+/* ------------------------------------------------------------------------- *
+ * Math Meadow — design tokens + base/reset.
+ *
+ * Concept: "SUNNY MEADOW / soft-pop tactile" — a warm, calm, confidence-
+ * building space for a ~6-year-old. Self-contained fonts (bundled via
+ * @fontsource, never a CDN) so the production `dist/` is fully offline.
+ * ------------------------------------------------------------------------- */
+
+/* Display = Fredoka (big numerals, headings, buttons). */
+@import "@fontsource/fredoka/400.css";
+@import "@fontsource/fredoka/500.css";
+@import "@fontsource/fredoka/600.css";
+@import "@fontsource/fredoka/700.css";
+
+/* Body = Nunito (everything else). */
+@import "@fontsource/nunito/400.css";
+@import "@fontsource/nunito/600.css";
+@import "@fontsource/nunito/700.css";
+
+:root {
+  /* --- color ------------------------------------------------------------ */
+  --bg: #fbf3e4;          /* warm cream meadow */
+  --surface: #ffffff;     /* floating cards */
+  --ink: #2c2417;         /* primary text */
+  --muted: #8a7e6b;       /* secondary text */
+
+  --primary: #ff7a4d;     /* tangerine — main actions */
+  --primary-ink: #ffffff; /* text on primary */
+  --secondary: #18b7a6;   /* teal — progress / accents */
+  --accent: #ffc53d;      /* sunny yellow — stars / highlights */
+
+  --success: #3fb75e;     /* correct */
+  --error: #e5594e;       /* wrong — used GENTLY, encouraging */
+
+  /* --- radii ------------------------------------------------------------ */
+  --r-card: 28px;
+  --r-pill: 999px;
+
+  /* --- soft warm shadows (depth via layered light, never flat fills) ---- */
+  --shadow-sm: 0 2px 6px rgba(120, 86, 40, 0.10);
+  --shadow-md: 0 10px 24px rgba(120, 86, 40, 0.14);
+  --shadow-lg: 0 22px 48px rgba(120, 86, 40, 0.18);
+  --shadow-press: 0 2px 6px rgba(120, 86, 40, 0.18);
+
+  /* --- typography ------------------------------------------------------- */
+  --font-display: "Fredoka", system-ui, sans-serif;
+  --font-body: "Nunito", system-ui, sans-serif;
+
+  /* The exercise equation numerals are HUGE. */
+  --size-numeral: clamp(3rem, 12vw, 6.5rem);
+
+  /* --- motion ----------------------------------------------------------- */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-quick: 160ms;
+  --dur-base: 280ms;
+
+  color-scheme: light;
+}
+
+/* --- reset ------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-body);
+  font-weight: 400;
+  color: var(--ink);
+  background-color: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  line-height: 1.5;
+
+  /* Warm cream canvas: a soft radial sun-glow near the top layered over a
+     subtle paper-grain noise, all sitting on the cream base. */
+  background-image:
+    radial-gradient(
+      90rem 50rem at 50% -18%,
+      rgba(255, 197, 61, 0.30) 0%,
+      rgba(255, 197, 61, 0.10) 32%,
+      rgba(255, 197, 61, 0) 64%
+    ),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+  background-repeat: no-repeat, repeat;
+  background-attachment: fixed, scroll;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+input,
+button,
+select,
+textarea {
+  font: inherit;
+}
+
+/* Visible, friendly focus ring for keyboard users. */
+:focus-visible {
+  outline: 3px solid var(--secondary);
+  outline-offset: 3px;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+/* --- reduced motion --------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  body {
+    /* The fixed glow stays; nothing animates. */
+    background-attachment: scroll, scroll;
+  }
+}

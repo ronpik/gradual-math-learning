@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .db import init_db
 from .dependencies import get_clock, get_repository, get_service
@@ -33,8 +36,22 @@ from .errors import (
     SessionNotFound,
 )
 from .routes import router
-from .settings import get_settings
+from .routes_play import router as play_router
+from .settings import Settings, get_settings
 from .sweeper import sweeper_loop
+
+
+def _resolve_web_dir(settings: Settings) -> Path:
+    """Resolve the directory holding the built static web client.
+
+    Honours ``settings.web_dir`` when set; otherwise defaults to
+    ``<repo_root>/packages/web-client-static/dist`` where ``repo_root`` is four
+    parents above this module.
+    """
+    if settings.web_dir is not None:
+        return Path(settings.web_dir)
+    repo_root = Path(__file__).resolve().parents[4]
+    return repo_root / "packages" / "web-client-static" / "dist"
 
 
 @asynccontextmanager
@@ -59,6 +76,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             interval_seconds=settings.sweeper_interval_seconds,
         )
     )
+
+    # Mount the static web client LAST so the explicit ``/health`` and ``/v1/*``
+    # routes (already registered on the app) always take precedence over the
+    # catch-all mount at "/". Skip silently if serving is disabled or the build
+    # directory does not exist yet (the server must run before the frontend is
+    # built).
+    if settings.serve_web:
+        web_dir = _resolve_web_dir(settings)
+        if web_dir.is_dir():
+            app.mount(
+                "/",
+                StaticFiles(directory=str(web_dir), html=True),
+                name="web",
+            )
+
     try:
         yield
     finally:
@@ -70,7 +102,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="math-practice-backend", lifespan=lifespan)
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.cors_allow_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(router)
+app.include_router(play_router)
 
 
 def _error_response(status_code: int, message: str) -> JSONResponse:

@@ -95,6 +95,32 @@ class StatsResult(NamedTuple):
     recent: list[TrialRecord]
 
 
+class StudentStats(NamedTuple):
+    """Student-safe aggregate statistics projection for a play session.
+
+    All engine internals (theta, mastery counts, per-trial scores) are excluded;
+    only the surface metrics the learner-facing UI needs are carried.
+
+    Attributes:
+        questions_done:            total number of recorded trials.
+        correct:                   number of correct trials.
+        accuracy:                  ``correct / questions_done`` (0 when none).
+        total_time_seconds:        summed response time over all trials.
+        avg_time_seconds:          mean response time per trial (0 when none).
+        module_completion_percent: percent of curriculum exercises mastered.
+        streak:                    consecutive correct answers ending at the most
+                                   recent trial.
+    """
+
+    questions_done: int
+    correct: int
+    accuracy: float
+    total_time_seconds: float
+    avg_time_seconds: float
+    module_completion_percent: float
+    streak: int
+
+
 class SessionService:
     """Use-case orchestration for practice sessions.
 
@@ -166,6 +192,78 @@ class SessionService:
             mastered_count=mastered_count,
             total=total,
             all_mastered=total > 0 and mastered_count >= total,
+        )
+
+    # ----- student-safe projections -----------------------------------------
+
+    @staticmethod
+    def module_completion_percent(agg: SessionAggregate) -> float:
+        """Percent of curriculum exercises mastered for a session.
+
+        Derived from :meth:`progress`: ``mastered_count / total * 100``. Returns
+        ``0.0`` when the curriculum is empty (``total == 0``).
+
+        Args:
+            agg: the session aggregate.
+
+        Returns:
+            The completion percentage in ``[0.0, 100.0]``.
+        """
+        p = SessionService.progress(agg)
+        if p.total == 0:
+            return 0.0
+        return p.mastered_count / p.total * 100.0
+
+    def current_streak(self, sid: str) -> int:
+        """Count consecutive correct answers ending at the most recent trial.
+
+        Walks the trial log newest-first and counts how many leading trials are
+        correct, stopping at the first wrong answer. Returns ``0`` when the most
+        recent trial is wrong or there are no trials.
+
+        Args:
+            sid: the session id.
+
+        Returns:
+            The current correct-answer streak.
+        """
+        streak = 0
+        for trial in self._repo.list_trials(sid):
+            if not trial.correct:
+                break
+            streak += 1
+        return streak
+
+    def get_student_stats(self, sid: str) -> StudentStats:
+        """Return the student-safe aggregate statistics for a session.
+
+        Loads and slides the session (persisting the slide), then computes the
+        learner-facing surface metrics without leaking any engine internals.
+
+        Args:
+            sid: the session id.
+
+        Returns:
+            A :class:`StudentStats` projection.
+
+        Raises:
+            SessionNotFound: if no such session exists.
+            SessionExpired:  if the session has expired.
+        """
+        agg = self._load(sid, persist_slide=True)
+        done = self._repo.count_trials(sid)
+        correct = self._repo.correct_count(sid)
+        total_time = self._repo.sum_response_time(sid)
+        accuracy = (correct / done) if done > 0 else 0.0
+        avg_time = (total_time / done) if done > 0 else 0.0
+        return StudentStats(
+            questions_done=done,
+            correct=correct,
+            accuracy=accuracy,
+            total_time_seconds=total_time,
+            avg_time_seconds=avg_time,
+            module_completion_percent=self.module_completion_percent(agg),
+            streak=self.current_streak(sid),
         )
 
     # ----- config validation ------------------------------------------------

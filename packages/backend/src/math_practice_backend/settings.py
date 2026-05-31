@@ -24,6 +24,11 @@ class Settings(BaseSettings):
                                   expired sessions.
         database_url:             SQLAlchemy database URL. Defaults to a shared
                                   in-memory SQLite database (ephemeral).
+        cors_allow_origins:       allowed CORS origins for browser clients.
+                                  Defaults to ``["*"]`` (any origin).
+        serve_web:                whether to mount the static web client at ``/``.
+        web_dir:                  explicit path to the built web client; when
+                                  ``None`` a repo-relative default is used.
     """
 
     model_config = SettingsConfigDict(
@@ -35,6 +40,9 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 24
     sweeper_interval_seconds: int = 600
     database_url: str = "sqlite+pysqlite:///:memory:"
+    cors_allow_origins: list[str] = ["*"]
+    serve_web: bool = True
+    web_dir: str | None = None
 
 
 @lru_cache(maxsize=1)

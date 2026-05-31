@@ -138,3 +138,43 @@ class StatsOut(BaseModel):
     correct: int
     accuracy: float
     recent: list[TrialOut] = Field(default_factory=list)
+
+
+# ----- student-safe schemas (the /v1/play API edge) ------------------------
+#
+# These omit every engine internal (theta, mastered_count, total, score ``s``,
+# predicted success ``E``). They are the *only* shapes the static web client
+# ever sees.
+
+
+class StudentSessionOut(BaseModel):
+    """Student-safe view returned when a play session is created."""
+
+    session_id: str
+    expires_at: datetime
+
+
+class StudentAnswerOut(BaseModel):
+    """Student-safe result of submitting an answer.
+
+    Carries only the freshly-recomputed surface metrics: whether the answer was
+    correct plus the post-answer counts the UI shows (questions done, module
+    completion percentage, current correct streak).
+    """
+
+    correct: bool
+    questions_done: int
+    module_completion_percent: float
+    streak: int
+
+
+class StudentStatsOut(BaseModel):
+    """Student-safe aggregate statistics for a play session."""
+
+    questions_done: int
+    correct: int
+    accuracy: float
+    total_time_seconds: float
+    avg_time_seconds: float
+    module_completion_percent: float
+    streak: int

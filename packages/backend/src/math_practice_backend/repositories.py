@@ -85,6 +85,10 @@ class SessionRepository(abc.ABC):
         """Return the number of correct trials recorded for the session."""
 
     @abc.abstractmethod
+    def sum_response_time(self, session_id: str) -> float:
+        """Return the summed response time over the session's trials (0 if none)."""
+
+    @abc.abstractmethod
     def delete(self, session_id: str) -> None:
         """Delete a session and (by cascade) its mastery rows and trials."""
 
@@ -318,6 +322,20 @@ class SqlAlchemySessionRepository(SessionRepository):
                 )
                 or 0
             )
+
+    def sum_response_time(self, session_id: str) -> float:
+        """Return the summed ``response_time`` over the session's trials.
+
+        Computed with a SQL ``SUM``; yields ``0.0`` when the session has no
+        recorded trials.
+        """
+        with self._session_factory() as db:
+            total = db.scalar(
+                select(func.sum(TrialRow.response_time)).where(
+                    TrialRow.session_id == session_id
+                )
+            )
+            return float(total) if total is not None else 0.0
 
     def delete(self, session_id: str) -> None:
         """Delete a session and cascade-delete its mastery rows and trials."""

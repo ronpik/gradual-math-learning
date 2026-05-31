@@ -1,5 +1,8 @@
 [tool.uv.workspace]
 members = ["packages/*"]
+# The static web client is a JS/TS package (Vite + React); it is not a Python
+# project, so keep uv from trying to resolve it as a workspace member.
+exclude = ["packages/web-client-static"]
 
 # Optional tooling, not part of the app runtime.
 # `scripts/plot_curves.py` renders the spec's formula figures.
