@@ -36,9 +36,9 @@ class MasteryState:
 class MasteryTracker:
     """Tracks the forgiving-streak mastery state of every curriculum item.
 
-    Per spec v1 ("Mastery"), for each exercise a trial is *qualifying* when it
-    is correct AND its trial score ``s`` is at least
-    ``config.mastery_score_threshold``.
+    For each exercise a trial is *qualifying* when it is correct AND answered
+    in under ``config.mastery_time_limit`` seconds (a correct-but-slow answer
+    does not count toward mastery).
 
         - qualifying trial:     ``streak += 1``
         - non-qualifying trial: ``faults += 1``; if ``faults > max_faults`` then
@@ -62,7 +62,9 @@ class MasteryTracker:
             exercise: MasteryState() for exercise in exercises
         }
 
-    def record(self, exercise: Exercise, correct: bool, s: float) -> MasteryState:
+    def record(
+        self, exercise: Exercise, correct: bool, response_time: float
+    ) -> MasteryState:
         """Record a trial outcome and return the updated state (spec v1).
 
         Applies the forgiving-streak rule described on the class. Once an
@@ -70,15 +72,16 @@ class MasteryTracker:
         streak/fault counters continue to update.
 
         Args:
-            exercise: the exercise that was attempted.
-            correct:  whether the answer was correct.
-            s:        the trial score for this attempt.
+            exercise:      the exercise that was attempted.
+            correct:       whether the answer was correct.
+            response_time: response time in seconds; a trial qualifies only when
+                           it is correct AND under ``mastery_time_limit``.
 
         Returns:
             The (mutated) :class:`MasteryState` for ``exercise``.
         """
         state = self._states[exercise]
-        qualifying = correct and s >= self._config.mastery_score_threshold
+        qualifying = correct and response_time < self._config.mastery_time_limit
 
         if qualifying:
             state.streak += 1

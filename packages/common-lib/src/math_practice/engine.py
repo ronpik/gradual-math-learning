@@ -112,8 +112,9 @@ class PracticeEngine:
         """Grade an answer, update ability and mastery, return the result (spec v1).
 
         The predicted success ``E`` and ``theta_before`` are captured before the
-        ability update; ``theta_after`` after it. Mastery is recorded from the
-        graded score ``s``.
+        ability update; ``theta_after`` after it. Mastery is recorded from
+        correctness and response time (qualifying = correct and under the
+        mastery time limit).
 
         Args:
             exercise:      the exercise that was attempted.
@@ -132,7 +133,7 @@ class PracticeEngine:
         theta_after = self._ability.theta
         self.theta = theta_after
 
-        mastery = self._mastery.record(exercise, correct, s)
+        mastery = self._mastery.record(exercise, correct, response_time)
 
         return TrialResult(
             exercise=exercise,

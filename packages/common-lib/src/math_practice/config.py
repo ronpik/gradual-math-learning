@@ -41,9 +41,10 @@ class EngineConfig:
         epsilon:               additive floor on selection weights.
 
     Mastery:
-        mastery_streak:          qualifying-trial streak required to master.
-        mastery_score_threshold: minimum ``s`` for a trial to qualify.
-        max_faults:              non-qualifying trials tolerated before reset.
+        mastery_streak:     qualifying-trial streak required to master.
+        mastery_time_limit: max response time (s, exclusive) for a correct
+                            trial to qualify toward mastery.
+        max_faults:         non-qualifying trials tolerated before reset.
     """
 
     MAX_SUM: int = 10
@@ -60,6 +61,6 @@ class EngineConfig:
     p_start: float = 0.90
     selection_temperature: float = 0.10  # tau_sel
     epsilon: float = 1e-3
-    mastery_streak: int = 7
-    mastery_score_threshold: float = 0.92
+    mastery_streak: int = 3
+    mastery_time_limit: float = 10.0
     max_faults: int = 2
