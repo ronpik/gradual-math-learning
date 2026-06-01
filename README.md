@@ -9,7 +9,8 @@ selection, and per-exercise mastery tracking.
 
 ```
 math-learn/
-├── pyproject.toml                 # uv workspace root (members = packages/*)
+├── pyproject.toml                 # uv workspace root (members = packages/*,
+│                                  #   web-client-static excluded — it is JS)
 └── packages/
     ├── common-lib/                # "math-practice": shared engine library
     │   └── src/math_practice/
@@ -30,9 +31,17 @@ math-learn/
     │       ├── domain.py          # internal dataclasses (persistence boundary)
     │       ├── db.py              # SQLAlchemy engine / session factory / Base
     │       └── app.py             # FastAPI app (lifespan + /health)
-    └── client/                    # "math-practice-client": HTTP client / CLI
-        └── src/math_practice_client/
-            └── app.py             # console entry point (main)
+    ├── client/                    # "math-practice-client": HTTP client / CLI
+    │   └── src/math_practice_client/
+    │       └── app.py             # console entry point (main)
+    └── web-client-static/         # "Math Meadow": React + Vite + TS static web app
+        ├── index.html
+        ├── package.json           # JS package (NOT a uv workspace member)
+        └── src/
+            ├── api/               # typed client + types for /v1/play
+            ├── components/        # ExerciseCard, Keypad, StatsModal, ...
+            ├── styles/            # Sunny-Meadow design tokens
+            └── App.tsx
 ```
 
 The `cli` package depends on `common-lib` via a uv workspace source, so the two
@@ -58,12 +67,17 @@ uv run math-practice
 
 ## Packages
 
-| Package         | Distribution name     | Import package        |
-|-----------------|-----------------------|-----------------------|
-| `common-lib`    | `math-practice`          | `math_practice`          |
-| `cli`           | `math-practice-cli`      | `math_practice_cli`      |
-| `backend`       | `math-practice-backend`  | `math_practice_backend`  |
-| `client`        | `math-practice-client`   | `math_practice_client`   |
+| Package              | Distribution name        | Import package           |
+|----------------------|--------------------------|--------------------------|
+| `common-lib`         | `math-practice`          | `math_practice`          |
+| `cli`                | `math-practice-cli`      | `math_practice_cli`      |
+| `backend`            | `math-practice-backend`  | `math_practice_backend`  |
+| `client`             | `math-practice-client`   | `math_practice_client`   |
+| `web-client-static`  | — (JS, npm `web-client-static`) | — (browser bundle) |
+
+> `web-client-static` is a JavaScript/TypeScript package (Vite + React), not a
+> Python project, so it is **excluded** from the uv workspace and managed with
+> `npm` instead of `uv`.
 
 ## Backend
 
@@ -101,3 +115,56 @@ Storage defaults to **in-memory SQLite** (SQLAlchemy 2.0 ORM, shared across
 connections via `StaticPool`), so all session and trial data is **ephemeral**
 and lost when the process exits. Switching to file SQLite or Postgres later only
 requires changing `MATH_PRACTICE_DATABASE_URL`.
+
+## Web client (`web-client-static`)
+
+`packages/web-client-static` is **Math Meadow** — a static, child-friendly
+single-page app (React + Vite + TypeScript) that drives the practice loop in the
+browser: it shows an exercise, accepts a typed answer (keyboard-first, `Enter`
+to submit, plus an on-screen keypad), gives instant feedback, and tracks a
+running "Done" count, a module-completion progress bar, a correct-streak, and a
+stats panel (accuracy + practice time).
+
+### Student-safe API
+
+The web client talks **only** to a dedicated `/v1/play` API that exposes
+learner-facing data and never leaks engine internals (no `theta`, no mastery
+counts, no totals, no per-trial score `s` or predicted success `E`). The full
+`/v1/sessions` API above remains the admin/diagnostic surface.
+
+| Method & path                              | Returns                                                  |
+|--------------------------------------------|----------------------------------------------------------|
+| `POST /v1/play/sessions`                   | `{ session_id, expires_at }`                             |
+| `POST /v1/play/sessions/{sid}/next`        | `{ a, b, op, issued_at }`                                |
+| `POST /v1/play/sessions/{sid}/answers`     | `{ correct, questions_done, module_completion_percent, streak }` |
+| `GET  /v1/play/sessions/{sid}/stats`       | `{ questions_done, correct, accuracy, total_time_seconds, avg_time_seconds, module_completion_percent, streak }` |
+
+The browser measures each answer's elapsed time (`performance.now()`) and sends
+it as `elapsed_seconds`; the server grades correctness. The `session_id` is kept
+in `localStorage` for transparent resume within the 24h window.
+
+### Running it
+
+```bash
+cd packages/web-client-static
+npm install
+
+# Option A — dev server with hot reload (proxies /v1 → http://127.0.0.1:8000).
+# Start the backend separately: uv run uvicorn math_practice_backend.app:app --reload
+npm run dev
+
+# Option B — production build, then serve it from the backend (one process).
+npm run build
+# The backend mounts packages/web-client-static/dist at "/" when it exists:
+uv run uvicorn math_practice_backend.app:app    # open http://127.0.0.1:8000/
+```
+
+The build output (`dist/`) is fully self-contained (fonts bundled via
+`@fontsource`, no CDN), so it can also be hosted on any static file server.
+Cross-origin use is covered by the backend's CORS settings
+(`MATH_PRACTICE_CORS_ALLOW_ORIGINS`); static serving is toggled with
+`MATH_PRACTICE_SERVE_WEB` / `MATH_PRACTICE_WEB_DIR`.
+
+### Requirements
+
+- Node.js 20+ and npm (only for this package; the Python packages do not need it).

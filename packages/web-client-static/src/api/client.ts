@@ -12,8 +12,11 @@
 import type {
   AnswerResult,
   Exercise,
+  ModeDescriptor,
+  ModuleDescriptor,
   StudentSession,
   StudentStats,
+  Summary,
 } from "./types";
 
 /** Error carrying the HTTP status so callers can branch on 404 / 410 / 409. */
@@ -77,15 +80,42 @@ async function request<T>(
   return (await response.json()) as T;
 }
 
-/** Create a new practice session. */
-export function createSession(): Promise<StudentSession> {
+/** List the available practice modules for the main screen. */
+export function listModules(): Promise<ModuleDescriptor[]> {
+  return request<ModuleDescriptor[]>("/v1/play/modules", { method: "GET" });
+}
+
+/** List the available practice modes for the main screen. */
+export function listModes(): Promise<ModeDescriptor[]> {
+  return request<ModeDescriptor[]>("/v1/play/modes", { method: "GET" });
+}
+
+/**
+ * Create a new practice run for a module + mode. `learnerId` is the long-lived
+ * learner identity (or `null` on first ever visit; the server mints one and
+ * returns it on the session).
+ */
+export function createSession(params: {
+  learnerId: string | null;
+  moduleId: string;
+  mode: string;
+}): Promise<StudentSession> {
   return request<StudentSession>("/v1/play/sessions", {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({
+      learner_id: params.learnerId,
+      module_id: params.moduleId,
+      mode: params.mode,
+    }),
   });
 }
 
-/** Draw the next exercise (re-shows the pending one on resume). */
+/**
+ * Draw the next exercise (re-shows the pending one on resume).
+ *
+ * A `409` means the run's stop rule is already met — it surfaces as
+ * `ApiError(409)` and is NOT swallowed; the caller navigates to the summary.
+ */
 export function getNext(sid: string): Promise<Exercise> {
   return request<Exercise>(
     `/v1/play/sessions/${encodeURIComponent(sid)}/next`,
@@ -108,6 +138,14 @@ export function submitAnswer(
       method: "POST",
       body: JSON.stringify({ answer, elapsed_seconds: elapsedSeconds }),
     },
+  );
+}
+
+/** Fetch the end-of-run summary (headline, personal best, per-level stars). */
+export function getSummary(sid: string): Promise<Summary> {
+  return request<Summary>(
+    `/v1/play/sessions/${encodeURIComponent(sid)}/summary`,
+    { method: "GET" },
   );
 }
 

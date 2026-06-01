@@ -40,6 +40,8 @@ export function ExerciseCard({
   const inputRef = useRef<HTMLInputElement>(null);
   const reduceMotion = useReducedMotion();
   const canSubmit = value.length > 0;
+  // Spoken operation name for the screen-reader prompt ("+" -> "plus").
+  const opWord = exercise.op === "-" ? "minus" : "plus";
 
   // Keep the input focused for keyboard-first play: on mount, on each new
   // exercise, and whenever we return to the answering phase.
@@ -118,7 +120,7 @@ export function ExerciseCard({
           {exercise.a}
         </span>
         <span className="equation__op" aria-hidden="true">
-          +
+          {exercise.op}
         </span>
         <span className="equation__slot" aria-hidden="true">
           {exercise.b}
@@ -130,7 +132,7 @@ export function ExerciseCard({
           ?
         </span>
         <span className="sr-only">
-          What is {exercise.a} plus {exercise.b}?
+          What is {exercise.a} {opWord} {exercise.b}?
         </span>
       </div>
 

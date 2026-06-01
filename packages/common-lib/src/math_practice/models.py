@@ -1,7 +1,7 @@
 """Domain models and curriculum construction (adaptive-practice-spec v1).
 
 Defines the :class:`Exercise` value object and :func:`build_curriculum`, the
-deterministic generator of the addition fact pool.
+deterministic generator of the addition or subtraction fact pool.
 """
 
 from __future__ import annotations
@@ -31,23 +31,41 @@ class Exercise:
         return f"{self.a} {self.op} {self.b}"
 
 
-def build_curriculum(max_sum: int) -> list[Exercise]:
-    """Build the ordered addition curriculum (spec v1).
+def build_curriculum(range_bound: int, op: str = "+") -> list[Exercise]:
+    """Build the ordered curriculum for an operation (spec v1).
 
-    Returns every ordered pair ``(a, b)`` with ``a >= 1``, ``b >= 1`` and
-    ``a + b <= max_sum``. Both orderings are included (``(2, 3)`` and
-    ``(3, 2)`` are distinct exercises).
+    The curriculum is the full, deterministic fact pool for ``op`` within
+    ``range_bound``; the order is stable: ascending by ``a``, then by ``b``.
 
-    The order is stable and deterministic: ascending by ``a``, then by ``b``.
+    For ``op == "+"`` returns every ordered pair ``(a, b)`` with ``a >= 1``,
+    ``b >= 1`` and ``a + b <= range_bound`` (``range_bound`` bounds the sum).
+    Both orderings are included (``(2, 3)`` and ``(3, 2)`` are distinct
+    exercises).
+
+    For ``op == "-"`` returns every pair ``(a, b)`` with minuend ``a`` in
+    ``1..range_bound`` and subtrahend ``b`` in ``1..a`` (``range_bound`` bounds
+    the minuend), so every exercise has a non-negative result ``a - b``.
 
     Args:
-        max_sum: inclusive upper bound on ``a + b``.
+        range_bound: inclusive curriculum bound -- the sum bound for addition
+            or the minuend bound for subtraction.
+        op: binary operator symbol; ``"+"`` (default) or ``"-"``.
 
     Returns:
         The curriculum as a list of :class:`Exercise` objects.
+
+    Raises:
+        ValueError: if ``op`` is neither ``"+"`` nor ``"-"``.
     """
     exercises: list[Exercise] = []
-    for a in range(1, max_sum):
-        for b in range(1, max_sum - a + 1):
-            exercises.append(Exercise(a=a, b=b))
+    if op == "+":
+        for a in range(1, range_bound):
+            for b in range(1, range_bound - a + 1):
+                exercises.append(Exercise(a=a, b=b, op="+"))
+    elif op == "-":
+        for a in range(1, range_bound + 1):
+            for b in range(1, a + 1):
+                exercises.append(Exercise(a=a, b=b, op="-"))
+    else:
+        raise ValueError(f"unknown op: {op!r}")
     return exercises

@@ -20,6 +20,8 @@ from math_practice import ExerciseMastery
 from . import mappers
 from .dependencies import get_repository, get_service
 from .domain import SessionAggregate, TrialRecord
+from .enums import Mode
+from .errors import UnknownMode
 from .repositories import SessionRepository
 from .schemas import (
     AnswerIn,
@@ -27,11 +29,17 @@ from .schemas import (
     ExerciseOut,
     HealthOut,
     ProgressOut,
+    SessionExerciseOut,
     SessionOut,
     StatsOut,
     TrialOut,
 )
 from .service import Progress, SessionService
+
+#: Defaults applied when the admin create request omits a module / mode, for
+#: back-compat with the v1 admin surface (the original ``add_10`` endless run).
+_DEFAULT_MODULE_ID = "add_10"
+_DEFAULT_MODE = Mode.ENDLESS
 
 
 def _progress_out(progress: Progress) -> ProgressOut:
@@ -69,14 +77,52 @@ async def create_session(
     body: CreateSessionIn | None = None,
     service: SessionService = Depends(get_service),
 ) -> SessionOut:
-    """Create a new practice session (no pending exercise yet)."""
+    """Create a new practice session (no pending exercise yet).
+
+    Accepts an optional ``module_id`` and ``mode``; both default for back-compat
+    (the ``add_10`` module in endless mode) when omitted. The admin surface mints
+    a fresh learner each time (``learner_id=None``), so there is no cross-session
+    progress to resume here.
+    """
     overrides = (
         body.config.to_overrides()
         if body is not None and body.config is not None
         else None
     )
-    agg = service.create_session(overrides)
+    module_id = (
+        body.module_id if body is not None and body.module_id is not None
+        else _DEFAULT_MODULE_ID
+    )
+    mode = (
+        _parse_mode(body.mode)
+        if body is not None and body.mode is not None
+        else _DEFAULT_MODE
+    )
+    agg = service.create_session(
+        learner_id=None,
+        module_id=module_id,
+        mode=mode,
+        overrides=overrides,
+    )
     return _session_out(agg, SessionService.progress(agg))
+
+
+def _parse_mode(mode: str) -> Mode:
+    """Resolve a wire mode string to a :class:`Mode`, else raise.
+
+    Args:
+        mode: the mode value sent by the client.
+
+    Returns:
+        The matching :class:`Mode` enum member.
+
+    Raises:
+        UnknownMode: if ``mode`` is not a recognised practice mode.
+    """
+    try:
+        return Mode(mode)
+    except ValueError as exc:
+        raise UnknownMode(mode) from exc
 
 
 @router.get(
@@ -168,6 +214,30 @@ async def get_stats(
         correct=result.correct,
         recent=recent,
     )
+
+
+@router.get(
+    "/v1/sessions/{sid}/exercises",
+    response_model=list[SessionExerciseOut],
+    tags=["sessions"],
+)
+async def get_session_exercises(
+    sid: str,
+    service: SessionService = Depends(get_service),
+    repo: SessionRepository = Depends(get_repository),
+) -> list[SessionExerciseOut]:
+    """Return the session's clean per-question audit log, ordered by ``seq``.
+
+    Validates existence/expiry first (so unknown ids yield 404 and expired ids
+    410 and the activity window slides), then reads the append-only
+    :class:`~math_practice_backend.domain.SessionExercise` rows — the
+    student-visible facts of each answer, free of engine internals.
+    """
+    service.get_session(sid)
+    return [
+        mappers.session_exercise_to_out(exercise)
+        for exercise in repo.list_session_exercises(sid)
+    ]
 
 
 def _mastery_for(

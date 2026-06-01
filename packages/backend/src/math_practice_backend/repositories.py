@@ -1,18 +1,26 @@
-"""Repository layer for practice sessions.
+"""Repository layer for practice sessions and learners.
 
-Defines the :class:`SessionRepository` abstract interface and a SQLAlchemy 2.0
-implementation. The repository is the *only* place ORM rows exist: every public
-method accepts and returns the domain dataclasses
+Defines two abstract persistence boundaries — :class:`SessionRepository` (the
+ephemeral 24h session aggregate plus its trial and audit logs) and
+:class:`LearnerRepository` (the permanent learner identity and its resumable
+per-(learner, module) progress) — each with a SQLAlchemy 2.0 implementation. The
+repositories are the *only* place ORM rows exist: every public method accepts and
+returns the domain dataclasses
 (:class:`~math_practice_backend.domain.SessionAggregate`,
-:class:`~math_practice_backend.domain.TrialRecord`) and the engine value objects
-(:class:`~math_practice.EngineState`,
+:class:`~math_practice_backend.domain.SessionExercise`,
+:class:`~math_practice_backend.domain.TrialRecord`,
+:class:`~math_practice_backend.domain.Learner`,
+:class:`~math_practice_backend.domain.ModuleProgress`) and the engine value
+objects (:class:`~math_practice.EngineState`,
 :class:`~math_practice.ExerciseMastery`,
 :class:`~math_practice.EngineConfig`). ORM objects never leak out.
 
-The repository owns serialisation: :class:`EngineConfig` maps to/from a JSON
-column via :func:`dataclasses.asdict` / ``EngineConfig(**d)``; mastery maps
-to/from ``session_mastery`` rows; and last-shown/pending exercises map to/from
-nullable columns.
+The repositories own serialisation: :class:`EngineConfig` maps to/from a JSON
+column via :func:`dataclasses.asdict` / ``EngineConfig(**d)``; session mastery maps
+to/from ``session_mastery`` rows; module-progress mastery maps to/from a JSON blob
+of ``{a, b, streak, faults, mastered}`` dicts; and last-shown/pending exercises map
+to/from nullable columns. The split keeps each interface cohesive and the two
+distinct lifetimes (permanent learner vs ephemeral session) explicit.
 """
 
 from __future__ import annotations
@@ -20,14 +28,31 @@ from __future__ import annotations
 import abc
 import dataclasses
 from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from math_practice import EngineConfig, EngineState, ExerciseMastery
 
-from .domain import PendingExercise, SessionAggregate, TrialRecord
-from .models import MasteryRow, SessionRow, TrialRow
+from .domain import (
+    Learner,
+    ModuleProgress,
+    PendingExercise,
+    SessionAggregate,
+    SessionExercise,
+    TrialRecord,
+)
+from .enums import Mode, SessionStatus
+from .models import (
+    LearnerModuleProgressRow,
+    LearnerRow,
+    MasteryRow,
+    SessionExerciseRow,
+    SessionRow,
+    TrialRow,
+)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -71,6 +96,18 @@ class SessionRepository(abc.ABC):
         """Append a graded trial to the session's trial log."""
 
     @abc.abstractmethod
+    def add_session_exercise(
+        self, session_id: str, exercise: SessionExercise
+    ) -> None:
+        """Append an answered question to the session's clean audit log."""
+
+    @abc.abstractmethod
+    def list_session_exercises(
+        self, session_id: str, limit: int | None = None
+    ) -> list[SessionExercise]:
+        """Return the session's audit rows ordered by ``seq`` (optionally capped)."""
+
+    @abc.abstractmethod
     def list_trials(
         self, session_id: str, limit: int | None = None
     ) -> list[TrialRecord]:
@@ -87,6 +124,25 @@ class SessionRepository(abc.ABC):
     @abc.abstractmethod
     def sum_response_time(self, session_id: str) -> float:
         """Return the summed response time over the session's trials (0 if none)."""
+
+    @abc.abstractmethod
+    def best_result(
+        self, learner_id: str, module_id: str, mode: Mode
+    ) -> float | int | None:
+        """Return the personal best over the learner's *completed* sessions.
+
+        Scoped to ``(learner_id, module_id, mode)`` and ``COMPLETED`` sessions:
+        for :attr:`Mode.FASTEST_20` the minimum ``total_time`` among sessions with
+        at least 20 answered; for :attr:`Mode.THREE_MINUTE` the maximum
+        ``questions_done``; for :attr:`Mode.ENDLESS` always ``None`` (no best).
+        Returns ``None`` when no qualifying session exists.
+        """
+
+    @abc.abstractmethod
+    def list_sessions_for_learner(
+        self, learner_id: str, limit: int | None = None
+    ) -> list[SessionAggregate]:
+        """Return the learner's sessions newest-first (optionally capped)."""
 
     @abc.abstractmethod
     def delete(self, session_id: str) -> None:
@@ -120,9 +176,17 @@ class SqlAlchemySessionRepository(SessionRepository):
     def _engine_state_to_row(row: SessionRow, agg: SessionAggregate) -> None:
         """Write an aggregate's metadata + engine state onto an ORM row."""
         state = agg.engine_state
+        row.learner_id = agg.learner_id
+        row.module_id = agg.module_id
+        row.mode = agg.mode.value
+        row.status = agg.status.value
         row.created_at = agg.created_at
+        row.started_at = agg.started_at
+        row.ended_at = agg.ended_at
         row.last_activity_at = agg.last_activity_at
         row.expires_at = agg.expires_at
+        row.target_count = agg.target_count
+        row.target_seconds = agg.target_seconds
         row.theta = state.theta
         row.config = dataclasses.asdict(state.config)
         if state.last_shown is None:
@@ -139,6 +203,9 @@ class SqlAlchemySessionRepository(SessionRepository):
             row.pending_b = agg.pending.b
             row.pending_issued_at = agg.pending.issued_at
         row.trial_seq = agg.trial_seq
+        row.questions_done = agg.questions_done
+        row.correct_count = agg.correct_count
+        row.total_time = agg.total_time
 
     @staticmethod
     def _mastery_rows(agg: SessionAggregate) -> list[MasteryRow]:
@@ -192,15 +259,27 @@ class SqlAlchemySessionRepository(SessionRepository):
                 a=row.pending_a,
                 b=row.pending_b,
                 issued_at=_as_utc(row.pending_issued_at),
+                op=config.op,
             )
         return SessionAggregate(
             id=row.id,
+            learner_id=row.learner_id,
+            module_id=row.module_id,
+            mode=Mode(row.mode),
+            status=SessionStatus(row.status),
             created_at=_as_utc(row.created_at),
+            started_at=_as_utc(row.started_at),
+            ended_at=_as_utc(row.ended_at) if row.ended_at is not None else None,
             last_activity_at=_as_utc(row.last_activity_at),
             expires_at=_as_utc(row.expires_at),
+            target_count=row.target_count,
+            target_seconds=row.target_seconds,
             engine_state=engine_state,
             pending=pending,
             trial_seq=row.trial_seq,
+            questions_done=row.questions_done,
+            correct_count=row.correct_count,
+            total_time=row.total_time,
         )
 
     @staticmethod
@@ -216,6 +295,23 @@ class SqlAlchemySessionRepository(SessionRepository):
             E=row.e,
             theta_before=row.theta_before,
             theta_after=row.theta_after,
+            created_at=_as_utc(row.created_at),
+        )
+
+    @staticmethod
+    def _session_exercise_row_to_record(
+        row: SessionExerciseRow,
+    ) -> SessionExercise:
+        """Map a ``session_exercises`` ORM row to a :class:`SessionExercise`."""
+        return SessionExercise(
+            seq=row.seq,
+            a=row.a,
+            b=row.b,
+            op=row.op,
+            level=row.level,
+            given_answer=row.given_answer,
+            correct=row.correct,
+            elapsed=row.elapsed,
             created_at=_as_utc(row.created_at),
         )
 
@@ -283,6 +379,42 @@ class SqlAlchemySessionRepository(SessionRepository):
             )
             db.commit()
 
+    def add_session_exercise(
+        self, session_id: str, exercise: SessionExercise
+    ) -> None:
+        """Append an answered question to the append-only audit log."""
+        with self._session_factory() as db:
+            db.add(
+                SessionExerciseRow(
+                    session_id=session_id,
+                    seq=exercise.seq,
+                    a=exercise.a,
+                    b=exercise.b,
+                    op=exercise.op,
+                    level=exercise.level,
+                    given_answer=exercise.given_answer,
+                    correct=exercise.correct,
+                    elapsed=exercise.elapsed,
+                    created_at=exercise.created_at,
+                )
+            )
+            db.commit()
+
+    def list_session_exercises(
+        self, session_id: str, limit: int | None = None
+    ) -> list[SessionExercise]:
+        """Return the session's audit rows ordered by ``seq`` (optionally capped)."""
+        with self._session_factory() as db:
+            stmt = (
+                select(SessionExerciseRow)
+                .where(SessionExerciseRow.session_id == session_id)
+                .order_by(SessionExerciseRow.seq.asc())
+            )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = db.scalars(stmt)
+            return [self._session_exercise_row_to_record(r) for r in rows]
+
     def list_trials(
         self, session_id: str, limit: int | None = None
     ) -> list[TrialRecord]:
@@ -337,6 +469,64 @@ class SqlAlchemySessionRepository(SessionRepository):
             )
             return float(total) if total is not None else 0.0
 
+    def best_result(
+        self, learner_id: str, module_id: str, mode: Mode
+    ) -> float | int | None:
+        """Return the personal best over the learner's *completed* sessions.
+
+        Scoped to ``(learner_id, module_id, mode)`` and
+        :attr:`SessionStatus.COMPLETED`. :attr:`Mode.FASTEST_20` returns the
+        minimum ``total_time`` among sessions with ``questions_done >= 20``;
+        :attr:`Mode.THREE_MINUTE` returns the maximum ``questions_done``;
+        :attr:`Mode.ENDLESS` has no best and returns ``None``. ``None`` is also
+        returned when no qualifying session exists.
+        """
+        if mode is Mode.ENDLESS:
+            return None
+        with self._session_factory() as db:
+            base = (
+                select(SessionRow)
+                .where(SessionRow.learner_id == learner_id)
+                .where(SessionRow.module_id == module_id)
+                .where(SessionRow.mode == mode.value)
+                .where(SessionRow.status == SessionStatus.COMPLETED.value)
+            )
+            if mode is Mode.FASTEST_20:
+                total = db.scalar(
+                    base.with_only_columns(func.min(SessionRow.total_time)).where(
+                        SessionRow.questions_done >= 20
+                    )
+                )
+                return float(total) if total is not None else None
+            # Mode.THREE_MINUTE
+            best = db.scalar(
+                base.with_only_columns(func.max(SessionRow.questions_done))
+            )
+            return int(best) if best is not None else None
+
+    def list_sessions_for_learner(
+        self, learner_id: str, limit: int | None = None
+    ) -> list[SessionAggregate]:
+        """Return the learner's sessions newest-first (optionally capped)."""
+        with self._session_factory() as db:
+            stmt = (
+                select(SessionRow)
+                .where(SessionRow.learner_id == learner_id)
+                .order_by(SessionRow.created_at.desc())
+            )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = list(db.scalars(stmt))
+            aggregates: list[SessionAggregate] = []
+            for row in rows:
+                mastery_rows = list(
+                    db.scalars(
+                        select(MasteryRow).where(MasteryRow.session_id == row.id)
+                    )
+                )
+                aggregates.append(self._row_to_aggregate(row, mastery_rows))
+            return aggregates
+
     def delete(self, session_id: str) -> None:
         """Delete a session and cascade-delete its mastery rows and trials."""
         with self._session_factory() as db:
@@ -366,3 +556,167 @@ class SqlAlchemySessionRepository(SessionRepository):
                     db.delete(row)
             db.commit()
             return len(expired_ids)
+
+
+class LearnerRepository(abc.ABC):
+    """Persistence boundary for permanent learners and their module progress.
+
+    Split from :class:`SessionRepository` because learners and their resumable
+    per-(learner, module) progress are a different aggregate with a different
+    lifetime (permanent vs the session's 24h sliding expiry). All methods
+    exchange domain dataclasses
+    (:class:`~math_practice_backend.domain.Learner`,
+    :class:`~math_practice_backend.domain.ModuleProgress`) and engine value
+    objects only; implementations must not expose ORM rows to callers.
+    """
+
+    @abc.abstractmethod
+    def get_or_create(self, learner_id: str | None, now: datetime) -> Learner:
+        """Return an existing learner, or create one stamped at ``now``.
+
+        When ``learner_id`` names an existing learner it is returned unchanged.
+        Otherwise a new learner is created — minting a fresh uuid4 hex id when
+        ``learner_id`` is ``None``, else adopting the provided id — with
+        ``created_at`` taken from the caller's clock (``now``).
+        """
+
+    @abc.abstractmethod
+    def get(self, learner_id: str) -> Learner | None:
+        """Load a learner by id, or ``None`` if it does not exist."""
+
+    @abc.abstractmethod
+    def get_progress(
+        self, learner_id: str, module_id: str
+    ) -> ModuleProgress | None:
+        """Load the learner's progress on ``module_id``, or ``None`` if absent."""
+
+    @abc.abstractmethod
+    def save_progress(self, progress: ModuleProgress) -> None:
+        """Upsert the learner's per-module progress (θ + mastery)."""
+
+
+class SqlAlchemyLearnerRepository(LearnerRepository):
+    """SQLAlchemy 2.0 implementation backed by a :class:`sessionmaker`.
+
+    A fresh :class:`~sqlalchemy.orm.Session` is opened and committed/rolled back
+    per public call, keeping the repository stateless and thread-safe for the
+    shared in-memory engine.
+    """
+
+    def __init__(self, session_factory: sessionmaker) -> None:
+        """Bind the repository to a session factory.
+
+        Args:
+            session_factory: a configured :class:`~sqlalchemy.orm.sessionmaker`
+                bound to the application engine.
+        """
+        self._session_factory = session_factory
+
+    # ----- (de)serialisation helpers ---------------------------------------
+
+    @staticmethod
+    def _mastery_to_json(
+        mastery: list[ExerciseMastery],
+    ) -> list[dict[str, Any]]:
+        """Serialise mastery value objects to ``{a, b, streak, faults, mastered}``."""
+        return [
+            {
+                "a": m.a,
+                "b": m.b,
+                "streak": m.streak,
+                "faults": m.faults,
+                "mastered": m.mastered,
+            }
+            for m in mastery
+        ]
+
+    @staticmethod
+    def _mastery_from_json(
+        blob: list[dict[str, Any]],
+    ) -> list[ExerciseMastery]:
+        """Deserialise a mastery JSON blob back to engine value objects."""
+        return [
+            ExerciseMastery(
+                a=d["a"],
+                b=d["b"],
+                streak=d["streak"],
+                faults=d["faults"],
+                mastered=d["mastered"],
+            )
+            for d in blob
+        ]
+
+    @staticmethod
+    def _learner_row_to_domain(row: LearnerRow) -> Learner:
+        """Map a ``learners`` ORM row to a :class:`Learner`."""
+        return Learner(id=row.id, created_at=_as_utc(row.created_at))
+
+    @classmethod
+    def _progress_row_to_domain(
+        cls, row: LearnerModuleProgressRow
+    ) -> ModuleProgress:
+        """Map a ``learner_module_progress`` ORM row to a :class:`ModuleProgress`."""
+        return ModuleProgress(
+            learner_id=row.learner_id,
+            module_id=row.module_id,
+            theta=row.theta,
+            mastery=cls._mastery_from_json(row.mastery_json),
+            updated_at=_as_utc(row.updated_at),
+        )
+
+    # ----- repository API ---------------------------------------------------
+
+    def get_or_create(self, learner_id: str | None, now: datetime) -> Learner:
+        """Return an existing learner, or create one stamped at ``now``."""
+        created_at = _as_utc(now)
+        with self._session_factory() as db:
+            if learner_id is not None:
+                row = db.get(LearnerRow, learner_id)
+                if row is not None:
+                    return self._learner_row_to_domain(row)
+            new_id = learner_id if learner_id is not None else uuid4().hex
+            row = LearnerRow(id=new_id, created_at=created_at)
+            db.add(row)
+            db.commit()
+            return Learner(id=new_id, created_at=created_at)
+
+    def get(self, learner_id: str) -> Learner | None:
+        """Load a learner by id, or ``None`` if absent."""
+        with self._session_factory() as db:
+            row = db.get(LearnerRow, learner_id)
+            if row is None:
+                return None
+            return self._learner_row_to_domain(row)
+
+    def get_progress(
+        self, learner_id: str, module_id: str
+    ) -> ModuleProgress | None:
+        """Load the learner's progress on ``module_id``, or ``None`` if absent."""
+        with self._session_factory() as db:
+            row = db.get(LearnerModuleProgressRow, (learner_id, module_id))
+            if row is None:
+                return None
+            return self._progress_row_to_domain(row)
+
+    def save_progress(self, progress: ModuleProgress) -> None:
+        """Upsert the learner's per-module progress (θ + mastery).
+
+        Keyed by ``(learner_id, module_id)``: an existing row is updated in
+        place, otherwise a new one is inserted. The mastery list is serialised
+        wholesale to the JSON blob column.
+        """
+        with self._session_factory() as db:
+            row = db.get(
+                LearnerModuleProgressRow,
+                (progress.learner_id, progress.module_id),
+            )
+            if row is None:
+                row = LearnerModuleProgressRow(
+                    learner_id=progress.learner_id,
+                    module_id=progress.module_id,
+                )
+                db.add(row)
+            row.theta = progress.theta
+            row.mastery_json = self._mastery_to_json(progress.mastery)
+            row.updated_at = _as_utc(progress.updated_at)
+            db.commit()

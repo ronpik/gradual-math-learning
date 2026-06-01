@@ -24,7 +24,12 @@ from sqlalchemy.orm import sessionmaker
 from .clock import Clock, RealClock
 from .db import engine as default_engine
 from .db import session_factory as default_session_factory
-from .repositories import SessionRepository, SqlAlchemySessionRepository
+from .repositories import (
+    LearnerRepository,
+    SessionRepository,
+    SqlAlchemyLearnerRepository,
+    SqlAlchemySessionRepository,
+)
 from .service import SessionService
 from .settings import Settings, get_settings
 
@@ -34,12 +39,15 @@ class _AppState:
     """Process-wide shared singletons for the HTTP layer.
 
     Attributes:
-        repository: the shared session repository (built once).
-        service:    the shared session service (built once).
-        clock:      the shared clock used by the service and sweeper.
+        repository:         the shared session repository (built once).
+        learner_repository: the shared learner/module-progress repository (built
+                            once).
+        service:            the shared session service (built once).
+        clock:              the shared clock used by the service and sweeper.
     """
 
     repository: SessionRepository | None = None
+    learner_repository: LearnerRepository | None = None
     service: SessionService | None = None
     clock: Clock | None = None
 
@@ -76,16 +84,33 @@ def get_repository() -> SessionRepository:
     return _state.repository
 
 
+def get_learner_repository() -> LearnerRepository:
+    """Return the shared :class:`LearnerRepository`, building it once.
+
+    Backed by :class:`SqlAlchemyLearnerRepository` over the shared session
+    factory. Split from the session repository because learners and their
+    cross-session module progress are a permanent aggregate with a different
+    lifetime than the ephemeral 24h session.
+    """
+    if _state.learner_repository is None:
+        _state.learner_repository = SqlAlchemyLearnerRepository(
+            get_session_factory()
+        )
+    return _state.learner_repository
+
+
 def get_service() -> SessionService:
     """Return the shared :class:`SessionService`, building it once.
 
-    The service is configured with the shared repository, a :class:`RealClock`,
-    and a sliding TTL of ``settings.session_ttl_hours`` hours.
+    The service is configured with the shared session repository, the shared
+    learner repository, a :class:`RealClock`, and a sliding TTL of
+    ``settings.session_ttl_hours`` hours.
     """
     if _state.service is None:
         settings: Settings = get_settings()
         _state.service = SessionService(
             repo=get_repository(),
+            learner_repo=get_learner_repository(),
             clock=get_clock(),
             ttl=timedelta(hours=settings.session_ttl_hours),
         )

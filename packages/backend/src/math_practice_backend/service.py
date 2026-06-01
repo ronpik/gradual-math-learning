@@ -3,16 +3,27 @@
 :class:`SessionService` is the single seam between the HTTP layer and the
 persistence + engine layers. It owns the session lifecycle:
 
-    * **create** — validate config overrides, build a fresh
-      :class:`~math_practice.PracticeEngine`, snapshot it, and persist a new
-      :class:`~math_practice_backend.domain.SessionAggregate`.
+    * **create** — resolve a module to an :class:`~math_practice.EngineConfig`,
+      seed the engine from the learner's resumable
+      :class:`~math_practice_backend.domain.ModuleProgress` (or cold-start), and
+      persist a new :class:`~math_practice_backend.domain.SessionAggregate` for the
+      chosen ``(module, mode)``.
     * **load + slide** — every session-scoped operation loads the aggregate,
       enforces the sliding-TTL expiry, and refreshes ``last_activity_at`` /
       ``expires_at``.
-    * **next** — draw (or re-show) the pending exercise.
-    * **answer** — grade against the server-known sum, update the engine, append
-      a trial, and clear the pending exercise.
-    * **stats** — aggregate progress and the recent trial log.
+    * **next** — honour the mode's stop rule, then draw (or re-show) the pending
+      exercise.
+    * **answer** — honour the mode's late-answer rule, grade op-aware against the
+      server-known result, update the engine, write progress through to
+      :class:`ModuleProgress`, and dual-log a :class:`TrialRecord` (engine trace)
+      and a :class:`SessionExercise` (clean audit row).
+    * **summary** — the run's headline metric, personal best, and per-level
+      mastery; **stats** — the student-safe aggregate projection.
+
+A **mode** never changes which exercise the engine selects next (selection is
+always the 85%-comfort softmax); it contributes only a server-enforced stop rule
+and a headline metric, resolved once via :func:`~math_practice_backend.modes.get_mode`
+so the service never branches on a mode string.
 
 Everything crossing this boundary is a dataclass; Pydantic lives only at the
 HTTP edge. Mutating operations are guarded by a per-session lock so concurrent
@@ -21,6 +32,7 @@ HTTP edge. Mutating operations are guarded by a per-session lock so concurrent
 
 from __future__ import annotations
 
+import dataclasses
 import random
 import threading
 import uuid
@@ -34,17 +46,28 @@ from math_practice import (
     Exercise,
     ExerciseMastery,
     PracticeEngine,
+    get_module,
 )
 
 from .clock import Clock
-from .domain import PendingExercise, SessionAggregate, TrialRecord
+from .domain import (
+    ModuleProgress,
+    PendingExercise,
+    SessionAggregate,
+    SessionExercise,
+    TrialRecord,
+)
+from .enums import Mode, SessionStatus
 from .errors import (
     InvalidConfig,
+    ModuleNotFound,
     NoPendingExercise,
+    SessionComplete,
     SessionExpired,
     SessionNotFound,
 )
-from .repositories import SessionRepository
+from .modes import get_mode
+from .repositories import LearnerRepository, SessionRepository
 
 
 class Progress(NamedTuple):
@@ -63,6 +86,20 @@ class Progress(NamedTuple):
     all_mastered: bool
 
 
+class LevelProgress(NamedTuple):
+    """Per-level completion projection (student-safe; no engine internals).
+
+    Attributes:
+        level:    the structural difficulty level (1..5).
+        mastered: number of mastered exercises within the level.
+        total:    total number of exercises within the level.
+    """
+
+    level: int
+    mastered: int
+    total: int
+
+
 class AnswerOutcome(NamedTuple):
     """Result bundle returned by :meth:`SessionService.submit_answer`.
 
@@ -70,11 +107,55 @@ class AnswerOutcome(NamedTuple):
         trial:    the persisted :class:`TrialRecord`.
         mastery:  the post-trial mastery state for the answered exercise.
         progress: session progress after applying the trial.
+        finished: whether the mode's stop rule is now met (the run is over).
+        remaining: the mode's small "what is left" payload (``questions_left`` /
+                  ``seconds_left`` / empty), suitable for the student surface.
     """
 
     trial: TrialRecord
     mastery: ExerciseMastery
     progress: Progress
+    finished: bool
+    remaining: dict
+
+
+class SummaryResult(NamedTuple):
+    """End-of-run summary projection returned by :meth:`SessionService.get_summary`.
+
+    Carries only derived, student-safe signals — the mode's headline metric, the
+    personal best and whether this run beat it, and per-level mastery counts. No
+    engine internals (θ, ``s``, ``E``) cross this boundary.
+
+    Attributes:
+        module_id:      the module practiced (e.g. ``"sub_20"``).
+        label:          the module's display label.
+        mode:           the practice mode.
+        status:         the session's lifecycle status.
+        questions_done: number of answered questions.
+        correct_count:  number of correct answers.
+        accuracy:       ``correct_count / questions_done`` (0 when none).
+        total_time:     summed answer time in seconds.
+        avg_time:       mean answer time per question (0 when none).
+        headline:       the mode's headline-metric payload.
+        best:           the personal best over completed sessions (mode-specific),
+                        or ``None`` when the mode has no best / none exists yet.
+        is_new_best:    whether this run set a new personal best.
+        level_progress: per-level mastery counts, ordered by level.
+    """
+
+    module_id: str
+    label: str
+    mode: Mode
+    status: SessionStatus
+    questions_done: int
+    correct_count: int
+    accuracy: float
+    total_time: float
+    avg_time: float
+    headline: dict
+    best: float | int | None
+    is_new_best: bool
+    level_progress: list[LevelProgress]
 
 
 class StatsResult(NamedTuple):
@@ -125,15 +206,20 @@ class SessionService:
     """Use-case orchestration for practice sessions.
 
     Wires a :class:`~math_practice_backend.repositories.SessionRepository`, a
-    :class:`~math_practice_backend.clock.Clock`, a sliding TTL, and an RNG
-    factory into the session lifecycle. The service is stateless except for a
-    lazily-built table of per-session locks; all durable state lives in the
-    repository.
+    :class:`~math_practice_backend.repositories.LearnerRepository`, a
+    :class:`~math_practice_backend.clock.Clock`, a sliding TTL, and an RNG factory
+    into the session lifecycle. The session repository owns the ephemeral 24h
+    aggregate (plus its trial and audit logs); the learner repository owns the
+    permanent learner identity and the resumable per-(learner, module) progress
+    the service seeds from and writes through on every answer. The service is
+    stateless except for a lazily-built table of per-session locks; all durable
+    state lives in the repositories.
     """
 
     def __init__(
         self,
         repo: SessionRepository,
+        learner_repo: LearnerRepository,
         clock: Clock,
         ttl: timedelta,
         rng_factory: Callable[[], random.Random] = lambda: random.Random(),
@@ -141,13 +227,17 @@ class SessionService:
         """Build the service.
 
         Args:
-            repo:        the session persistence boundary.
-            clock:       source of aware-UTC "now".
-            ttl:         sliding retention window; ``expires_at = now + ttl``.
-            rng_factory: factory producing a fresh :class:`random.Random` for
+            repo:         the session persistence boundary (ephemeral aggregate +
+                logs).
+            learner_repo: the learner/module-progress persistence boundary
+                (permanent identity + resumable progress).
+            clock:        source of aware-UTC "now".
+            ttl:          sliding retention window; ``expires_at = now + ttl``.
+            rng_factory:  factory producing a fresh :class:`random.Random` for
                 each engine rehydration (kept injectable for determinism).
         """
         self._repo = repo
+        self._learner_repo = learner_repo
         self._clock = clock
         self._ttl = ttl
         self._rng_factory = rng_factory
@@ -266,39 +356,59 @@ class SessionService:
             streak=self.current_streak(sid),
         )
 
-    # ----- config validation ------------------------------------------------
+    # ----- config building --------------------------------------------------
 
     @staticmethod
-    def _build_config(overrides: dict | None) -> EngineConfig:
-        """Validate overrides and build an :class:`EngineConfig`.
+    def build_module_config(
+        module_id: str, overrides: dict | None
+    ) -> EngineConfig:
+        """Resolve a module to an :class:`EngineConfig`, applying any overrides.
 
-        Unknown keys and type-incompatible values both raise
-        :class:`InvalidConfig`. ``None`` / empty overrides yield the default
-        config.
+        The base config is built from the module spec (its op, range, and
+        per-module time/mastery knobs); ``overrides`` then patch individual
+        :class:`EngineConfig` fields. Override validation mirrors the field
+        annotations: ``int`` fields accept ints, ``float`` fields accept numbers
+        (coerced to float), ``str`` fields (e.g. ``op``) accept strings;
+        ``applicable_levels`` is structural and may not be overridden. The
+        resolved config must keep ``range_bound >= 2``.
 
         Args:
-            overrides: optional partial mapping of ``EngineConfig`` field names
-                to values.
+            module_id: the module to resolve (e.g. ``"sub_20"``).
+            overrides: optional partial mapping of ``EngineConfig`` field names to
+                values.
 
         Returns:
             The constructed (frozen) :class:`EngineConfig`.
 
         Raises:
-            InvalidConfig: on unknown keys or invalid values.
+            ModuleNotFound: if ``module_id`` is not in the module registry.
+            InvalidConfig:  on unknown / disallowed keys or invalid values, or if
+                the resolved ``range_bound`` is below 2.
         """
+        try:
+            spec = get_module(module_id)
+        except ValueError as exc:
+            raise ModuleNotFound(module_id) from exc
+
+        base = spec.build_config()
         if not overrides:
-            return EngineConfig()
+            return base
 
         field_types = {f.name: f.type for f in fields(EngineConfig)}
         unknown = sorted(set(overrides) - set(field_types))
         if unknown:
             raise InvalidConfig(f"Unknown config field(s): {', '.join(unknown)}")
+        if "applicable_levels" in overrides:
+            raise InvalidConfig(
+                "Config field 'applicable_levels' cannot be overridden"
+            )
 
         coerced: dict = {}
         for name, value in overrides.items():
             expected = field_types[name]
-            # Field annotations are simple ("int"/"float"); coerce numerics so
-            # an int passed for a float field is accepted, reject the rest.
+            # Field annotations are simple strings; coerce numerics so an int
+            # passed for a float field is accepted, accept strings for str
+            # fields (e.g. ``op``), and reject the rest.
             if expected == "int":
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise InvalidConfig(
@@ -313,16 +423,23 @@ class SessionService:
                         f"{type(value).__name__}"
                     )
                 coerced[name] = float(value)
+            elif expected == "str":
+                if not isinstance(value, str):
+                    raise InvalidConfig(
+                        f"Config field {name!r} expects a string, got "
+                        f"{type(value).__name__}"
+                    )
+                coerced[name] = value
             else:
                 coerced[name] = value
 
         try:
-            config = EngineConfig(**coerced)
+            config = dataclasses.replace(base, **coerced)
         except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
             raise InvalidConfig(f"Invalid config overrides: {exc}") from exc
 
-        if config.MAX_SUM < 2:
-            raise InvalidConfig("Config field 'MAX_SUM' must be >= 2")
+        if config.range_bound < 2:
+            raise InvalidConfig("Config field 'range_bound' must be >= 2")
         return config
 
     # ----- load / expiry / slide -------------------------------------------
@@ -368,36 +485,74 @@ class SessionService:
 
     # ----- public use cases -------------------------------------------------
 
-    def create_session(self, overrides: dict | None = None) -> SessionAggregate:
-        """Create and persist a brand-new practice session.
+    def create_session(
+        self,
+        learner_id: str | None,
+        module_id: str,
+        mode: Mode,
+        overrides: dict | None = None,
+    ) -> SessionAggregate:
+        """Create and persist a brand-new practice run for a ``(module, mode)``.
 
-        Validates ``overrides`` into an :class:`EngineConfig`, builds a fresh
-        :class:`PracticeEngine`, snapshots it, and persists a new aggregate with
-        a uuid4-hex id, timestamps, ``expires_at = now + ttl``, no pending
-        exercise, and ``trial_seq = 0``.
+        Resolves (or mints) the learner, builds the module's
+        :class:`EngineConfig`, and seeds a fresh
+        :class:`~math_practice.PracticeEngine` from the learner's resumable
+        :class:`ModuleProgress` for that module if present (so θ + mastery carry
+        over), else cold-starts. The engine snapshot, the mode's stop-rule targets
+        (``target_count`` / ``target_seconds``), and ``started_at == created_at``
+        (so a timed mode's deadline is known at creation) are recorded on a new
+        ``ACTIVE`` aggregate with a uuid4-hex id.
 
         Args:
-            overrides: optional partial ``EngineConfig`` field overrides.
+            learner_id: the owning learner's id, or ``None`` to mint a new one.
+            module_id:  the module to practice (e.g. ``"add_20"``).
+            mode:       the practice mode (stop rule + headline metric).
+            overrides:  optional partial ``EngineConfig`` field overrides.
 
         Returns:
             The newly created :class:`SessionAggregate`.
 
         Raises:
-            InvalidConfig: if any override is unknown or invalid.
+            ModuleNotFound: if ``module_id`` is not in the module registry.
+            InvalidConfig:  if any override is unknown or invalid.
+            UnknownMode:    if ``mode`` is not a registered practice mode.
         """
-        config = self._build_config(overrides)
-        engine = PracticeEngine(config=config, rng=self._rng_factory())
-        state = engine.snapshot()
-
         now = self._clock.now()
+        learner = self._learner_repo.get_or_create(learner_id, now)
+        config = self.build_module_config(module_id, overrides)
+
+        progress = self._learner_repo.get_progress(learner.id, module_id)
+        if progress is not None:
+            state = EngineState(
+                theta=progress.theta,
+                config=config,
+                mastery=progress.mastery,
+                last_shown=None,
+            )
+            engine = PracticeEngine.from_state(state, rng=self._rng_factory())
+        else:
+            engine = PracticeEngine(config=config, rng=self._rng_factory())
+
+        mode_strategy = get_mode(mode)
         agg = SessionAggregate(
             id=uuid.uuid4().hex,
+            learner_id=learner.id,
+            module_id=module_id,
+            mode=mode,
+            status=SessionStatus.ACTIVE,
             created_at=now,
+            started_at=now,
+            ended_at=None,
             last_activity_at=now,
             expires_at=now + self._ttl,
-            engine_state=state,
+            target_count=mode_strategy.target_count(),
+            target_seconds=mode_strategy.target_seconds(),
+            engine_state=engine.snapshot(),
             pending=None,
             trial_seq=0,
+            questions_done=0,
+            correct_count=0,
+            total_time=0.0,
         )
         self._repo.create(agg)
         return agg
@@ -420,10 +575,15 @@ class SessionService:
     def get_next(self, sid: str) -> PendingExercise:
         """Return the pending exercise, drawing a new one if none is pending.
 
-        Guarded by the per-session lock. If a pending exercise already exists it
-        is returned unchanged (resume re-show). Otherwise the engine is
-        rehydrated, a new exercise is drawn, recorded as the pending exercise,
-        and the updated engine snapshot (capturing ``last_shown``) is persisted.
+        Guarded by the per-session lock. A completed session is immutable and
+        raises :class:`SessionComplete`. Otherwise the mode's stop rule is
+        evaluated: if already met the session is marked ``COMPLETED`` (with
+        ``ended_at``), persisted, and :class:`SessionComplete` is raised. If a
+        pending exercise already exists it is returned unchanged (resume
+        re-show). Otherwise the engine is rehydrated, a new exercise is drawn,
+        recorded as the pending exercise (carrying the engine's op so the client
+        can render it), and the updated engine snapshot (capturing
+        ``last_shown``) is persisted.
 
         Args:
             sid: the session id.
@@ -434,9 +594,20 @@ class SessionService:
         Raises:
             SessionNotFound: if no such session exists.
             SessionExpired:  if the session has expired.
+            SessionComplete: if the session has already met its stop rule.
         """
         with self._lock_for(sid):
             agg = self._load(sid)
+            if agg.status is SessionStatus.COMPLETED:
+                raise SessionComplete(sid)
+
+            mode = get_mode(agg.mode)
+            now = self._clock.now()
+            if mode.is_complete(agg, now):
+                agg.status = SessionStatus.COMPLETED
+                agg.ended_at = now
+                self._repo.save(agg)
+                raise SessionComplete(sid)
 
             if agg.pending is not None:
                 self._repo.save(agg)  # persist the activity slide
@@ -446,9 +617,11 @@ class SessionService:
                 agg.engine_state, rng=self._rng_factory()
             )
             exercise = engine.next_exercise()
-            now = self._clock.now()
             pending = PendingExercise(
-                a=exercise.a, b=exercise.b, issued_at=now
+                a=exercise.a,
+                b=exercise.b,
+                issued_at=now,
+                op=agg.engine_state.config.op,
             )
             agg.pending = pending
             agg.engine_state = engine.snapshot()
@@ -458,16 +631,25 @@ class SessionService:
     def submit_answer(
         self, sid: str, answer: int, elapsed: float
     ) -> AnswerOutcome:
-        """Grade an answer, update the engine, persist a trial, clear pending.
+        """Grade an answer op-aware, update progress, and dual-log the trial.
 
-        Guarded by the per-session lock. The pending exercise is required
-        (otherwise :class:`NoPendingExercise`). Correctness is graded
-        server-side: ``answer == a + b`` *and* ``elapsed < config.TIME_LIMIT``.
-        The engine is rehydrated and asked to grade the trial; the resulting
-        before/after ability, score, and predicted success are recorded into a
-        :class:`TrialRecord`. The engine snapshot and bumped ``trial_seq`` are
-        persisted, the pending exercise is cleared, and the trial is appended to
-        the log.
+        Guarded by the per-session lock. A completed session is immutable and
+        raises :class:`SessionComplete`; a pending exercise is required
+        (otherwise :class:`NoPendingExercise`). The mode's late-answer rule is
+        checked first: an answer the mode rejects (e.g. arriving at or past the
+        3-minute deadline) closes the session ``COMPLETED`` and raises
+        :class:`SessionComplete` without recording the trial.
+
+        Correctness is graded server-side and op-aware: ``expected = a + b`` for
+        ``"+"`` and ``a - b`` for ``"-"``; ``correct`` requires ``answer ==
+        expected`` *and* ``elapsed < config.TIME_LIMIT``. The engine is rehydrated
+        and asked to grade the trial; the result feeds both an engine-trace
+        :class:`TrialRecord` and a clean :class:`SessionExercise` audit row. The
+        denormalized metrics, engine snapshot, and bumped ``trial_seq`` are
+        updated and the pending exercise cleared. Progress is **written through**
+        to :class:`ModuleProgress` so it survives an abandoned session, and the
+        mode's stop rule is re-evaluated to set ``COMPLETED`` when this answer
+        ends the run.
 
         Args:
             sid:     the session id.
@@ -475,31 +657,45 @@ class SessionService:
             elapsed: client-measured elapsed seconds (``>= 0``).
 
         Returns:
-            An :class:`AnswerOutcome` (trial, post-trial mastery, progress).
+            An :class:`AnswerOutcome` (trial, post-trial mastery, progress,
+            whether the run is finished, and the mode's ``remaining`` payload).
 
         Raises:
             SessionNotFound:   if no such session exists.
             SessionExpired:    if the session has expired.
+            SessionComplete:   if the session is already complete or the answer
+                arrived too late for a timed mode.
             NoPendingExercise: if no exercise is currently pending.
         """
         with self._lock_for(sid):
             agg = self._load(sid)
+            if agg.status is SessionStatus.COMPLETED:
+                raise SessionComplete(sid)
             if agg.pending is None:
                 raise NoPendingExercise(sid)
 
-            pending = agg.pending
-            exercise = Exercise(a=pending.a, b=pending.b)
-            config = agg.engine_state.config
-            correct = (answer == pending.a + pending.b) and (
-                elapsed < config.TIME_LIMIT
-            )
+            mode = get_mode(agg.mode)
+            now = self._clock.now()
+            if not mode.accepts_answer(agg, now):
+                agg.status = SessionStatus.COMPLETED
+                agg.ended_at = now
+                self._repo.save(agg)
+                raise SessionComplete(sid)
 
+            pending = agg.pending
+            config = agg.engine_state.config
+            op = config.op
+            expected = (
+                pending.a + pending.b if op == "+" else pending.a - pending.b
+            )
+            correct = (answer == expected) and (elapsed < config.TIME_LIMIT)
+
+            exercise = Exercise(a=pending.a, b=pending.b, op=op)
             engine = PracticeEngine.from_state(
                 agg.engine_state, rng=self._rng_factory()
             )
             result = engine.submit(exercise, correct, elapsed)
 
-            now = self._clock.now()
             seq = agg.trial_seq + 1
             trial = TrialRecord(
                 seq=seq,
@@ -513,12 +709,44 @@ class SessionService:
                 theta_after=result.theta_after,
                 created_at=now,
             )
+            audit = SessionExercise(
+                seq=seq,
+                a=pending.a,
+                b=pending.b,
+                op=op,
+                level=result.level,
+                given_answer=answer,
+                correct=correct,
+                elapsed=elapsed,
+                created_at=now,
+            )
 
             agg.engine_state = engine.snapshot()
             agg.trial_seq = seq
             agg.pending = None
+            agg.questions_done += 1
+            agg.correct_count += int(correct)
+            agg.total_time += elapsed
+
+            # Write-through: persist θ + mastery so progress survives an
+            # abandoned session and seeds the next run for this (learner, module).
+            self._learner_repo.save_progress(
+                ModuleProgress(
+                    learner_id=agg.learner_id,
+                    module_id=agg.module_id,
+                    theta=agg.engine_state.theta,
+                    mastery=agg.engine_state.mastery,
+                    updated_at=now,
+                )
+            )
+
+            finished = mode.is_complete(agg, now)
+            if finished:
+                agg.status = SessionStatus.COMPLETED
+                agg.ended_at = now
 
             self._repo.add_trial(sid, trial)
+            self._repo.add_session_exercise(sid, audit)
             self._repo.save(agg)
 
             mastery = ExerciseMastery(
@@ -532,7 +760,97 @@ class SessionService:
                 trial=trial,
                 mastery=mastery,
                 progress=self._progress_from_state(agg.engine_state),
+                finished=finished,
+                remaining=mode.remaining(agg, now),
             )
+
+    def get_summary(self, sid: str) -> SummaryResult:
+        """Return the run's student-safe end-of-run summary.
+
+        Loads and slides the session (persisting the slide), rehydrates an engine
+        from the snapshot purely to read per-level mastery, and compares the run's
+        headline against the learner's personal best for this
+        ``(module, mode)``. The "new best" comparison is mode-aware: smaller is
+        better for the time-based Fastest-20 best, larger for the count-based
+        3-minute best; Endless has no best so ``is_new_best`` is always ``False``.
+
+        Args:
+            sid: the session id.
+
+        Returns:
+            A :class:`SummaryResult` (headline, personal best, per-level mastery).
+
+        Raises:
+            SessionNotFound: if no such session exists.
+            SessionExpired:  if the session has expired.
+        """
+        agg = self._load(sid, persist_slide=True)
+        mode = get_mode(agg.mode)
+
+        engine = PracticeEngine.from_state(
+            agg.engine_state, rng=self._rng_factory()
+        )
+        level_progress = [
+            LevelProgress(level=level, mastered=mastered, total=total)
+            for level, (mastered, total) in sorted(
+                engine.level_progress().items()
+            )
+        ]
+
+        done = agg.questions_done
+        accuracy = (agg.correct_count / done) if done > 0 else 0.0
+        avg_time = (agg.total_time / done) if done > 0 else 0.0
+
+        best = self._repo.best_result(agg.learner_id, agg.module_id, agg.mode)
+        headline = mode.headline(agg)
+        is_new_best = self._is_new_best(agg.mode, headline, best)
+
+        return SummaryResult(
+            module_id=agg.module_id,
+            label=get_module(agg.module_id).label,
+            mode=agg.mode,
+            status=agg.status,
+            questions_done=done,
+            correct_count=agg.correct_count,
+            accuracy=accuracy,
+            total_time=agg.total_time,
+            avg_time=avg_time,
+            headline=headline,
+            best=best,
+            is_new_best=is_new_best,
+            level_progress=level_progress,
+        )
+
+    @staticmethod
+    def _is_new_best(
+        mode: Mode, headline: dict, best: float | int | None
+    ) -> bool:
+        """Compare a run's headline against the personal best for its mode.
+
+        Fastest-20 is time-based (lower is better); 3-minute is count-based
+        (higher is better); Endless has no best. A ``None`` best (no prior
+        qualifying session, or a mode without a best) means this run is the best
+        only for the modes that *have* one.
+
+        Args:
+            mode:     the practice mode.
+            headline: the run's headline-metric payload.
+            best:     the personal best over prior completed sessions, if any.
+
+        Returns:
+            ``True`` when this run set a new personal best.
+        """
+        if mode is Mode.FASTEST_20:
+            value = headline.get("total_time_seconds")
+            if value is None:
+                return False
+            return best is None or value < best
+        if mode is Mode.THREE_MINUTE:
+            value = headline.get("questions_done")
+            if value is None:
+                return False
+            return best is None or value > best
+        return False
 
     def get_stats(self, sid: str) -> StatsResult:
         """Return aggregate progress plus the recent trial log for a session.

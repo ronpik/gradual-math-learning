@@ -1,8 +1,12 @@
 # Python / uv
 .venv/
 __pycache__/
-*.pyc
+*.py
 
 # uv may write a lock; keep it tracked, ignore caches
 .uv/
+
+vibe-coding
+.claude
 docs
+vbcd-dev

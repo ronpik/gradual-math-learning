@@ -7,10 +7,18 @@ selection, mastery tracking, and the orchestrating :class:`PracticeEngine`.
 
 from .ability import AbilityTracker
 from .config import EngineConfig
-from .difficulty import AdditionFixedDifficultyScorer, DifficultyScorer
+from .difficulty import (
+    AdditionFixedDifficultyScorer,
+    AdditionLevelScorer,
+    DifficultyScorer,
+    LeveledDifficultyScorer,
+    SubtractionLevelScorer,
+    default_scorer_for,
+)
 from .engine import PracticeEngine, TrialResult
 from .mastery import MasteryState, MasteryTracker
 from .models import Exercise, build_curriculum
+from .modules import MODULES, ModuleSpec, curriculum_for, get_module
 from .selection import SelectionPolicy
 from .state import EngineState, ExerciseMastery
 
@@ -22,6 +30,14 @@ __all__ = [
     "build_curriculum",
     "DifficultyScorer",
     "AdditionFixedDifficultyScorer",
+    "LeveledDifficultyScorer",
+    "AdditionLevelScorer",
+    "SubtractionLevelScorer",
+    "default_scorer_for",
+    "ModuleSpec",
+    "MODULES",
+    "get_module",
+    "curriculum_for",
     "AbilityTracker",
     "SelectionPolicy",
     "MasteryState",

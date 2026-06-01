@@ -10,6 +10,9 @@ Service-layer error mapping:
     * :class:`SessionExpired`    -> 410
     * :class:`NoPendingExercise` -> 409
     * :class:`InvalidConfig`     -> 422
+    * :class:`SessionComplete`   -> 409
+    * :class:`ModuleNotFound`    -> 404
+    * :class:`UnknownMode`       -> 422
 
 All error responses share the shape ``{"detail": <message>}``.
 """
@@ -30,10 +33,13 @@ from .db import init_db
 from .dependencies import get_clock, get_repository, get_service
 from .errors import (
     InvalidConfig,
+    ModuleNotFound,
     NoPendingExercise,
     ServiceError,
+    SessionComplete,
     SessionExpired,
     SessionNotFound,
+    UnknownMode,
 )
 from .routes import router
 from .routes_play import router as play_router
@@ -150,6 +156,34 @@ async def _handle_invalid_config(
     request: Request, exc: InvalidConfig
 ) -> JSONResponse:
     """Map :class:`InvalidConfig` to ``422 Unprocessable Entity``."""
+    return _error_response(422, exc.message)
+
+
+@app.exception_handler(SessionComplete)
+async def _handle_session_complete(
+    request: Request, exc: SessionComplete
+) -> JSONResponse:
+    """Map :class:`SessionComplete` to ``409 Conflict``.
+
+    Signals the client that the run is over and it should move to the summary
+    (or start a fresh session to replay).
+    """
+    return _error_response(409, exc.message)
+
+
+@app.exception_handler(ModuleNotFound)
+async def _handle_module_not_found(
+    request: Request, exc: ModuleNotFound
+) -> JSONResponse:
+    """Map :class:`ModuleNotFound` to ``404 Not Found``."""
+    return _error_response(404, exc.message)
+
+
+@app.exception_handler(UnknownMode)
+async def _handle_unknown_mode(
+    request: Request, exc: UnknownMode
+) -> JSONResponse:
+    """Map :class:`UnknownMode` to ``422 Unprocessable Entity``."""
     return _error_response(422, exc.message)
 
 

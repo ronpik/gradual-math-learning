@@ -14,9 +14,14 @@ from dataclasses import dataclass
 
 from .ability import AbilityTracker
 from .config import EngineConfig
-from .difficulty import AdditionFixedDifficultyScorer, DifficultyScorer
+from .difficulty import (
+    DifficultyScorer,
+    LeveledDifficultyScorer,
+    default_scorer_for,
+)
 from .mastery import MasteryState, MasteryTracker
-from .models import Exercise, build_curriculum
+from .models import Exercise
+from .modules import curriculum_for
 from .selection import SelectionPolicy
 from .state import EngineState, ExerciseMastery
 
@@ -37,6 +42,9 @@ class TrialResult:
         theta_before:  ability immediately before the update.
         theta_after:   ability immediately after the update.
         mastery:       the (mutated) mastery state for ``exercise``.
+        level:         the structural difficulty level of ``exercise`` (``1..5``
+                       for a leveled scorer, ``0`` when the scorer exposes no
+                       ``level``).
     """
 
     exercise: Exercise
@@ -47,6 +55,7 @@ class TrialResult:
     theta_before: float
     theta_after: float
     mastery: MasteryState
+    level: int
 
 
 class PracticeEngine:
@@ -67,19 +76,34 @@ class PracticeEngine:
 
         Args:
             config: engine hyper-parameters; defaults to :class:`EngineConfig`.
-            scorer: difficulty scorer; defaults to
-                :class:`AdditionFixedDifficultyScorer` over ``config``.
+            scorer: difficulty scorer; defaults to the leveled scorer for
+                ``config.op`` (via
+                :func:`~math_practice.difficulty.default_scorer_for`).
             rng:    random source for selection; defaults to a fresh
                 :class:`random.Random`.
         """
         self.config: EngineConfig = config if config is not None else EngineConfig()
-        self._scorer: DifficultyScorer = (
-            scorer if scorer is not None else AdditionFixedDifficultyScorer(self.config)
-        )
         self._rng: random.Random = rng if rng is not None else random.Random()
 
-        # Build the fixed curriculum pool once (spec: nothing is removed).
-        self._exercises: list[Exercise] = build_curriculum(self.config.MAX_SUM)
+        # Build the fixed curriculum pool once, op-aware and restricted to the
+        # config's applicable levels (a module only contains the subset its range
+        # permits, modules design §2); the shared cached list must not be mutated.
+        self._exercises: list[Exercise] = curriculum_for(
+            self.config.op,
+            self.config.range_bound,
+            self.config.applicable_levels,
+        )
+
+        # Default to the leveled scorer for this operation. A leveled scorer is
+        # pool-aware, so fit it to the pool BEFORE it is used to precompute
+        # difficulties (selection) or the cold-start b_min, otherwise delta is 0.
+        self._scorer: DifficultyScorer = (
+            scorer
+            if scorer is not None
+            else default_scorer_for(self.config)
+        )
+        if isinstance(self._scorer, LeveledDifficultyScorer):
+            self._scorer.fit(self._exercises)
 
         # Collaborating components share the one config + exercise pool.
         self._ability = AbilityTracker(self.config)
@@ -146,7 +170,26 @@ class PracticeEngine:
             theta_before=theta_before,
             theta_after=theta_after,
             mastery=mastery,
+            level=self._level_of(exercise),
         )
+
+    def _level_of(self, exercise: Exercise) -> int:
+        """Return the structural level of ``exercise`` (``0`` if unsupported).
+
+        Delegates to the scorer's ``level`` method when it exposes one (every
+        :class:`~math_practice.difficulty.LeveledDifficultyScorer` does); a
+        scorer without levels (e.g.
+        :class:`~math_practice.difficulty.AdditionFixedDifficultyScorer`) yields
+        the sentinel ``0``.
+
+        Args:
+            exercise: the exercise whose level to look up.
+
+        Returns:
+            The structural difficulty level, or ``0`` when the scorer has none.
+        """
+        level = getattr(self._scorer, "level", None)
+        return level(exercise) if callable(level) else 0
 
     def snapshot(self) -> EngineState:
         """Capture the full mutable engine state as an :class:`EngineState` (spec v1).
@@ -208,9 +251,11 @@ class PracticeEngine:
         engine._ability.theta = state.theta
         engine.theta = state.theta
 
-        # Restore mastery, keyed by exercise operands.
+        # Restore mastery, keyed by exercise operands. The operator comes from
+        # the restored config so subtraction keys match the rebuilt curriculum.
+        op = state.config.op
         restored: dict[Exercise, MasteryState] = {
-            Exercise(a=item.a, b=item.b): MasteryState(
+            Exercise(a=item.a, b=item.b, op=op): MasteryState(
                 streak=item.streak,
                 faults=item.faults,
                 mastered=item.mastered,
@@ -222,7 +267,7 @@ class PracticeEngine:
         # Restore the exclusion target for the next draw.
         if state.last_shown is not None:
             a, b = state.last_shown
-            engine._last_shown = Exercise(a=a, b=b)
+            engine._last_shown = Exercise(a=a, b=b, op=op)
 
         return engine
 
@@ -237,3 +282,22 @@ class PracticeEngine:
     def all_mastered(self) -> bool:
         """Return ``True`` when every curriculum exercise is mastered."""
         return self._mastery.all_mastered()
+
+    def level_progress(self) -> dict[int, tuple[int, int]]:
+        """Return per-level ``(mastered_count, total)`` over the pool.
+
+        Buckets every curriculum exercise by its structural level (via the
+        scorer's ``level`` lookup; ``0`` when the scorer has none) and counts how
+        many in each bucket are currently mastered. Only levels with at least one
+        exercise are included, so the keys are exactly the structural levels the
+        module's range permits.
+
+        Returns:
+            A mapping from structural level to ``(mastered_count, total)``.
+        """
+        progress: dict[int, tuple[int, int]] = {}
+        for exercise, state in self._mastery.items():
+            lvl = self._level_of(exercise)
+            mastered, total = progress.get(lvl, (0, 0))
+            progress[lvl] = (mastered + (1 if state.mastered else 0), total + 1)
+        return progress

@@ -1,10 +1,11 @@
 /**
  * Math Meadow — the play experience.
  *
- * Owns app state and the answer flow: boot (resume or create a session) ->
- * getNext -> show & time -> submit -> feedback -> auto-advance. Talks only to
- * the student-safe `/v1/play` API. Renders only student-safe figures (equation,
- * done-count, module %, accuracy, time, streak) — never engine internals.
+ * Owns app state and the flow: menu (pick module + method) -> playing (boot:
+ * resume or create a run) -> getNext -> show & time -> submit -> feedback ->
+ * auto-advance -> summary. Talks only to the student-safe `/v1/play` API and
+ * renders only student-safe figures (equation, done-count, module %, accuracy,
+ * time, streak, per-mode HUD) — never engine internals.
  */
 import {
   useCallback,
@@ -15,12 +16,28 @@ import {
 import type { JSX } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 
-import { ApiError, createSession, getNext, submitAnswer } from "./api/client";
-import type { Exercise } from "./api/types";
 import {
-  clearSessionId,
-  readSessionId,
-  saveSessionId,
+  ApiError,
+  createSession,
+  getNext,
+  getSummary,
+  listModes,
+  listModules,
+  submitAnswer,
+} from "./api/client";
+import type {
+  Exercise,
+  ModeDescriptor,
+  ModuleDescriptor,
+  Summary,
+} from "./api/types";
+import {
+  clearRun,
+  readLearnerId,
+  readRun,
+  saveLearnerId,
+  saveRun,
+  type RunContext,
 } from "./session";
 import {
   playCorrect,
@@ -35,10 +52,12 @@ import {
   type FeedbackState,
   type Phase,
 } from "./components/ExerciseCard";
+import { MainMenu } from "./components/MainMenu";
+import { SessionSummary } from "./components/SessionSummary";
 import { StatsModal } from "./components/StatsModal";
 import "./styles/app.css";
 
-type Boot = "loading" | "ready" | "error";
+type View = "loading" | "menu" | "playing" | "summary" | "error";
 
 const ADVANCE_DELAY_MS = 1500;
 
@@ -61,18 +80,44 @@ function pick(list: string[]): string {
   return list[Math.floor(Math.random() * list.length)];
 }
 
+/** True for the ApiError(409) the server raises once a run's stop rule is met. */
+function isComplete(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409;
+}
+
+/** True for the "session gone" statuses — expired/unknown -> start over. */
+function isGone(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 404 || err.status === 410);
+}
+
 export default function App(): JSX.Element {
-  const [boot, setBoot] = useState<Boot>("loading");
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [view, setView] = useState<View>("loading");
+
+  // Menu data (loaded once when entering the menu).
+  const [modules, setModules] = useState<ModuleDescriptor[]>([]);
+  const [modes, setModes] = useState<ModeDescriptor[]>([]);
+  const [menuBusy, setMenuBusy] = useState(false);
+  const [menuError, setMenuError] = useState<string | null>(null);
+
+  // Long-lived learner identity.
+  const [learnerId, setLearnerId] = useState<string | null>(() =>
+    readLearnerId(),
+  );
+
+  // Active run context (null until a run is started/resumed).
+  const [run, setRun] = useState<RunContext | null>(null);
+
+  // Play state.
   const [exercise, setExercise] = useState<Exercise | null>(null);
   const [phase, setPhase] = useState<Phase>("answering");
-
   const [value, setValue] = useState("");
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
-
   const [done, setDone] = useState(0);
   const [percent, setPercent] = useState(0);
   const [streak, setStreak] = useState(0);
+
+  // Summary view.
+  const [summary, setSummary] = useState<Summary | null>(null);
 
   const [statsOpen, setStatsOpen] = useState(false);
   const [soundOn, setSoundOn] = useState<boolean>(() => readSoundPref());
@@ -83,6 +128,8 @@ export default function App(): JSX.Element {
   const advanceTimerRef = useRef<number | null>(null);
   // Guards against double-submits.
   const submittingRef = useRef(false);
+  // Guards against double-navigation to the summary (finished / 409 / expiry).
+  const endingRef = useRef(false);
 
   const clearAdvanceTimer = useCallback(() => {
     if (advanceTimerRef.current !== null) {
@@ -100,73 +147,144 @@ export default function App(): JSX.Element {
     shownAtRef.current = performance.now();
   }, []);
 
-  /** Create a brand-new session and draw its first exercise. */
-  const startFresh = useCallback(async () => {
-    setBoot("loading");
-    clearSessionId();
-    setDone(0);
-    setPercent(0);
-    setStreak(0);
-    try {
-      const session = await createSession();
-      saveSessionId(session.session_id);
-      setSessionId(session.session_id);
-      const ex = await getNext(session.session_id);
-      presentExercise(ex);
-      setBoot("ready");
-    } catch {
-      setBoot("error");
+  /** Load the menu descriptors and switch to the menu view. */
+  const goToMenu = useCallback(async () => {
+    clearAdvanceTimer();
+    clearRun();
+    setRun(null);
+    setExercise(null);
+    setSummary(null);
+    setStatsOpen(false);
+    setMenuError(null);
+    setMenuBusy(false);
+    endingRef.current = false;
+    // Reuse already-loaded descriptors when we have them.
+    if (modules.length > 0 && modes.length > 0) {
+      setView("menu");
+      return;
     }
-  }, [presentExercise]);
+    setView("loading");
+    try {
+      const [mods, mds] = await Promise.all([listModules(), listModes()]);
+      setModules(mods);
+      setModes(mds);
+      setView("menu");
+    } catch {
+      setView("error");
+    }
+  }, [clearAdvanceTimer, modes.length, modules.length]);
 
-  /** Draw the next exercise for an existing session; recover on expiry. */
-  const loadNext = useCallback(
+  /** Fetch and show the end-of-run summary for a session. Guarded once. */
+  const goToSummary = useCallback(
     async (sid: string) => {
+      if (endingRef.current) {
+        return;
+      }
+      endingRef.current = true;
+      clearAdvanceTimer();
       try {
-        const ex = await getNext(sid);
-        presentExercise(ex);
+        const result = await getSummary(sid);
+        setSummary(result);
+        setView("summary");
       } catch (err) {
-        if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
-          await startFresh();
+        if (isGone(err)) {
+          // The run vanished out from under us — fall back to the menu.
+          await goToMenu();
         } else {
-          setBoot("error");
+          setView("error");
         }
       }
     },
-    [presentExercise, startFresh],
+    [clearAdvanceTimer, goToMenu],
   );
 
-  // Boot: resume a stored session, else create one.
+  /**
+   * Start a run for `moduleId` + `modeId`: create the session, persist the
+   * learner id + run context, draw the first exercise, and enter "playing".
+   * Shared by the menu's Start and the summary's Play again.
+   */
+  const startRun = useCallback(
+    async (moduleId: string, modeId: string) => {
+      clearAdvanceTimer();
+      setMenuBusy(true);
+      setMenuError(null);
+      try {
+        const session = await createSession({
+          learnerId,
+          moduleId,
+          mode: modeId,
+        });
+        saveLearnerId(session.learner_id);
+        setLearnerId(session.learner_id);
+        const ctx: RunContext = {
+          sessionId: session.session_id,
+          moduleId: session.module_id,
+          mode: session.mode,
+          targetCount: session.target_count,
+          targetSeconds: session.target_seconds,
+          deadline: session.deadline,
+        };
+        saveRun(ctx);
+        const ex = await getNext(session.session_id);
+        // Reset the per-run play state.
+        setDone(0);
+        setPercent(0);
+        setStreak(0);
+        setSummary(null);
+        endingRef.current = false;
+        setRun(ctx);
+        presentExercise(ex);
+        setMenuBusy(false);
+        setView("playing");
+      } catch (err) {
+        setMenuBusy(false);
+        if (isComplete(err)) {
+          // Extremely unlikely on a fresh run, but be safe.
+          setView("summary");
+        } else {
+          setMenuError("Couldn't start — please try again.");
+        }
+      }
+    },
+    [clearAdvanceTimer, learnerId, presentExercise],
+  );
+
+  // Boot: resume a stored run, else show the menu.
   useEffect(() => {
     let alive = true;
     (async () => {
-      const stored = readSessionId();
+      const stored = readRun();
       if (stored) {
         try {
-          const ex = await getNext(stored);
+          const ex = await getNext(stored.sessionId);
           if (!alive) {
             return;
           }
-          setSessionId(stored);
-          saveSessionId(stored);
+          setRun(stored);
+          saveRun(stored);
+          endingRef.current = false;
           presentExercise(ex);
-          setBoot("ready");
+          setView("playing");
           return;
         } catch (err) {
-          if (
-            !(err instanceof ApiError) ||
-            (err.status !== 404 && err.status !== 410)
-          ) {
-            if (alive) {
-              setBoot("error");
-            }
+          if (!alive) {
             return;
           }
-          // Expired/unknown — fall through to a fresh session.
+          if (isComplete(err)) {
+            await goToSummary(stored.sessionId);
+            return;
+          }
+          if (isGone(err)) {
+            clearRun();
+            // Fall through to the menu.
+          } else {
+            setView("error");
+            return;
+          }
         }
       }
       if (alive) {
-        await startFresh();
+        await goToMenu();
       }
     })();
     return () => {
@@ -179,19 +297,42 @@ export default function App(): JSX.Element {
   // Tidy the advance timer on unmount.
   useEffect(() => clearAdvanceTimer, [clearAdvanceTimer]);
 
+  /** Draw the next exercise; route 409 -> summary, gone -> menu. */
+  const loadNext = useCallback(
+    async (sid: string) => {
+      try {
+        const ex = await getNext(sid);
+        presentExercise(ex);
+      } catch (err) {
+        if (isComplete(err)) {
+          await goToSummary(sid);
+        } else if (isGone(err)) {
+          await goToMenu();
+        } else {
+          setView("error");
+        }
+      }
+    },
+    [goToMenu, goToSummary, presentExercise],
+  );
+
   const advance = useCallback(() => {
     clearAdvanceTimer();
-    if (sessionId) {
-      void loadNext(sessionId);
+    if (endingRef.current) {
+      return;
     }
-  }, [clearAdvanceTimer, loadNext, sessionId]);
+    if (run) {
+      void loadNext(run.sessionId);
+    }
+  }, [clearAdvanceTimer, loadNext, run]);
 
   const handleSubmit = useCallback(async () => {
     if (
-      !sessionId ||
+      !run ||
       !exercise ||
       phase !== "answering" ||
-      submittingRef.current
+      submittingRef.current ||
+      endingRef.current
     ) {
       return;
     }
@@ -205,7 +346,7 @@ export default function App(): JSX.Element {
       (performance.now() - shownAtRef.current) / 1000,
     );
     try {
-      const result = await submitAnswer(sessionId, answer, elapsedSeconds);
+      const result = await submitAnswer(run.sessionId, answer, elapsedSeconds);
       setDone(result.questions_done);
       setPercent(result.module_completion_percent);
       setStreak(result.streak);
@@ -225,15 +366,21 @@ export default function App(): JSX.Element {
         celebrate();
       }
       clearAdvanceTimer();
-      advanceTimerRef.current = window.setTimeout(advance, ADVANCE_DELAY_MS);
-    } catch (err) {
-      if (
-        err instanceof ApiError &&
-        (err.status === 404 || err.status === 410)
-      ) {
-        await startFresh();
+      if (result.finished) {
+        // Let the feedback land, then surface the summary.
+        advanceTimerRef.current = window.setTimeout(() => {
+          void goToSummary(run.sessionId);
+        }, ADVANCE_DELAY_MS);
       } else {
-        setBoot("error");
+        advanceTimerRef.current = window.setTimeout(advance, ADVANCE_DELAY_MS);
+      }
+    } catch (err) {
+      if (isComplete(err)) {
+        await goToSummary(run.sessionId);
+      } else if (isGone(err)) {
+        await goToMenu();
+      } else {
+        setView("error");
       }
     } finally {
       submittingRef.current = false;
@@ -242,8 +389,10 @@ export default function App(): JSX.Element {
     advance,
     clearAdvanceTimer,
     exercise,
+    goToMenu,
+    goToSummary,
     phase,
-    sessionId,
+    run,
     soundOn,
     value,
   ]);
@@ -267,16 +416,16 @@ export default function App(): JSX.Element {
     });
   }, []);
 
-  const handleNewSession = useCallback(() => {
-    const ok = window.confirm(
-      "Start a brand-new session? Your current progress will be cleared.",
-    );
-    if (ok) {
-      clearAdvanceTimer();
-      setStatsOpen(false);
-      void startFresh();
+  /** The 3-minute countdown hit zero — close out the run into the summary. */
+  const handleDeadlineExpire = useCallback(() => {
+    if (run) {
+      void goToSummary(run.sessionId);
     }
-  }, [clearAdvanceTimer, startFresh]);
+  }, [goToSummary, run]);
+
+  const handleQuit = useCallback(() => {
+    void goToMenu();
+  }, [goToMenu]);
 
   // --- render ---------------------------------------------------------- //
 
@@ -298,14 +447,14 @@ export default function App(): JSX.Element {
       </div>
 
       <main className="app">
-        {boot === "loading" && (
+        {view === "loading" && (
           <div className="banner" role="status" aria-live="polite">
             <div className="spinner" style={{ margin: "0 auto" }} />
             <p>Getting your meadow ready…</p>
           </div>
         )}
 
-        {boot === "error" && (
+        {view === "error" && (
           <div className="banner" role="alert">
             <span className="banner__emoji" aria-hidden="true">
               🌧️
@@ -314,14 +463,32 @@ export default function App(): JSX.Element {
             <button
               type="button"
               className="btn btn--primary"
-              onClick={() => void startFresh()}
+              onClick={() => void goToMenu()}
             >
               Try again
             </button>
           </div>
         )}
 
-        {boot === "ready" && exercise && sessionId && (
+        {view === "menu" && (
+          <motion.div
+            style={{ width: "min(100%, 40rem)", display: "flex", justifyContent: "center" }}
+            custom={0}
+            variants={reveal}
+            initial="hidden"
+            animate="show"
+          >
+            <MainMenu
+              modules={modules}
+              modes={modes}
+              onStart={(moduleId, modeId) => void startRun(moduleId, modeId)}
+              busy={menuBusy}
+              error={menuError}
+            />
+          </motion.div>
+        )}
+
+        {view === "playing" && exercise && run && (
           <>
             <motion.div
               style={{ width: "min(100%, 46rem)", display: "flex", justifyContent: "center" }}
@@ -333,10 +500,15 @@ export default function App(): JSX.Element {
               <Header
                 done={done}
                 percent={percent}
+                mode={run.mode}
+                targetCount={run.targetCount}
+                questionsDone={done}
+                deadline={run.deadline}
+                onDeadlineExpire={handleDeadlineExpire}
                 soundOn={soundOn}
                 onToggleSound={handleToggleSound}
                 onOpenStats={() => setStatsOpen(true)}
-                onNewSession={handleNewSession}
+                onQuit={handleQuit}
               />
             </motion.div>
 
@@ -360,12 +532,28 @@ export default function App(): JSX.Element {
             </motion.div>
           </>
         )}
+
+        {view === "summary" && summary && run && (
+          <motion.div
+            style={{ width: "min(100%, 32rem)", display: "flex", justifyContent: "center" }}
+            custom={0}
+            variants={reveal}
+            initial="hidden"
+            animate="show"
+          >
+            <SessionSummary
+              summary={summary}
+              onPlayAgain={() => void startRun(run.moduleId, run.mode)}
+              onMenu={() => void goToMenu()}
+            />
+          </motion.div>
+        )}
       </main>
 
       <AnimatePresence>
-        {statsOpen && sessionId && (
+        {statsOpen && run && (
           <StatsModal
-            sessionId={sessionId}
+            sessionId={run.sessionId}
             onClose={() => setStatsOpen(false)}
           />
         )}

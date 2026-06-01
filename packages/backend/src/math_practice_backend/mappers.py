@@ -13,20 +13,22 @@ trivial and handled inline by the schemas themselves
 
 from __future__ import annotations
 
-from math_practice import EngineState, ExerciseMastery
+from math_practice import EngineState, ExerciseMastery, ModuleSpec
 
-from .domain import PendingExercise, SessionAggregate, TrialRecord
+from .domain import PendingExercise, SessionAggregate, SessionExercise, TrialRecord
 from .schemas import (
     ExerciseOut,
+    LevelProgressOut,
     MasteryOut,
+    ModuleOut,
     ProgressOut,
+    SessionExerciseOut,
     SessionOut,
     StatsOut,
+    StudentSummaryOut,
     TrialOut,
 )
-
-#: Operator label surfaced to clients (the curriculum is addition-only, v1).
-OP_ADD = "+"
+from .service import LevelProgress, SummaryResult
 
 
 def progress_to_out(
@@ -52,11 +54,15 @@ def progress_to_out(
 
 
 def pending_to_exercise_out(pending: PendingExercise) -> ExerciseOut:
-    """Map a :class:`PendingExercise` dataclass to an :class:`ExerciseOut`."""
+    """Map a :class:`PendingExercise` dataclass to an :class:`ExerciseOut`.
+
+    Carries the pending exercise's own ``op`` (``"+"`` or ``"-"``) so the client
+    renders the correct operator instead of assuming addition.
+    """
     return ExerciseOut(
         a=pending.a,
         b=pending.b,
-        op=OP_ADD,
+        op=pending.op,
         issued_at=pending.issued_at,
     )
 
@@ -85,6 +91,9 @@ def session_to_out(
     """
     return SessionOut(
         session_id=agg.id,
+        module_id=agg.module_id,
+        mode=agg.mode.value,
+        status=agg.status.value,
         created_at=agg.created_at,
         last_activity_at=agg.last_activity_at,
         expires_at=agg.expires_at,
@@ -148,4 +157,76 @@ def build_stats_out(
         correct=correct,
         accuracy=accuracy,
         recent=recent,
+    )
+
+
+def session_exercise_to_out(exercise: SessionExercise) -> SessionExerciseOut:
+    """Map a :class:`SessionExercise` audit row to a :class:`SessionExerciseOut`."""
+    return SessionExerciseOut(
+        seq=exercise.seq,
+        a=exercise.a,
+        b=exercise.b,
+        op=exercise.op,
+        level=exercise.level,
+        given_answer=exercise.given_answer,
+        correct=exercise.correct,
+        elapsed=exercise.elapsed,
+        created_at=exercise.created_at,
+    )
+
+
+def module_to_out(spec: ModuleSpec) -> ModuleOut:
+    """Map an engine :class:`~math_practice.ModuleSpec` to a :class:`ModuleOut`.
+
+    Surfaces only the student-safe descriptor fields — id, operator, range
+    bound, label, and the module's applicable structural levels — never the
+    config knobs or scorer.
+    """
+    return ModuleOut(
+        id=spec.id,
+        op=spec.op,
+        range_bound=spec.range_bound,
+        label=spec.label,
+        levels=list(spec.applicable_levels),
+    )
+
+
+def level_progress_to_out(level: LevelProgress) -> LevelProgressOut:
+    """Map a service :class:`LevelProgress` to a :class:`LevelProgressOut`."""
+    return LevelProgressOut(
+        level=level.level,
+        mastered=level.mastered,
+        total=level.total,
+    )
+
+
+def summary_to_out(summary: SummaryResult) -> StudentSummaryOut:
+    """Map a service :class:`SummaryResult` to a :class:`StudentSummaryOut`.
+
+    The mode's personal best is a count (int) for the 3-minute mode and a
+    duration (float) for Fastest-20; it is widened to ``float`` (or left
+    ``None``) on the student surface so the shape is uniform.
+
+    Args:
+        summary: the end-of-run summary projection.
+
+    Returns:
+        The student-safe summary payload — headline, personal best, and
+        per-level mastery — with no engine internals.
+    """
+    best = summary.best
+    return StudentSummaryOut(
+        module_id=summary.module_id,
+        label=summary.label,
+        mode=summary.mode.value,
+        status=summary.status.value,
+        questions_done=summary.questions_done,
+        correct=summary.correct_count,
+        accuracy=summary.accuracy,
+        total_time_seconds=summary.total_time,
+        avg_time_seconds=summary.avg_time,
+        headline=summary.headline,
+        personal_best=(float(best) if best is not None else None),
+        is_new_best=summary.is_new_best,
+        levels=[level_progress_to_out(lp) for lp in summary.level_progress],
     )
