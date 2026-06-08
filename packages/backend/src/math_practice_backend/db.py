@@ -11,15 +11,37 @@ SQLite-specific connect args are applied only for SQLite URLs).
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, create_engine
+import logging
+
+from sqlalchemy import Engine, MetaData, create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from .settings import Settings, get_settings
 
+logger = logging.getLogger(__name__)
+
+#: Stable constraint/index naming convention so Alembic ``--autogenerate``
+#: yields deterministic, identical names across SQLite and Postgres. Without
+#: this, unnamed constraints get backend-specific (or no) names, and batch
+#: ALTERs on SQLite cannot reliably reference them.
+NAMING_CONVENTION: dict[str, str] = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
 
 class Base(DeclarativeBase):
-    """Declarative base class for all backend ORM models."""
+    """Declarative base class for all backend ORM models.
+
+    The shared :class:`~sqlalchemy.MetaData` carries :data:`NAMING_CONVENTION`
+    so every implicit constraint/index name is deterministic across backends.
+    """
+
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
 def create_db_engine(settings: Settings | None = None) -> Engine:
@@ -54,10 +76,31 @@ session_factory: sessionmaker = sessionmaker(bind=engine, future=True)
 
 
 def init_db(eng: Engine | None = None) -> None:
-    """Create all ORM tables if they do not already exist.
+    """Provision the schema on startup, dialect-aware.
+
+    For **SQLite** URLs (the in-memory/file dev path and the test suite) the
+    tables are created in-process via ``Base.metadata.create_all`` so no
+    migration step is needed. For every **other** backend (Postgres) the schema
+    is owned by Alembic — ``alembic upgrade head`` is expected to have run at
+    deploy time — so this function does *not* create tables and leaves the
+    database untouched.
+
+    Either way the chosen path is logged.
 
     Args:
-        eng: engine to create the schema in; defaults to the module-level
-            :data:`engine`.
+        eng: engine to provision; defaults to the module-level :data:`engine`.
     """
-    Base.metadata.create_all(eng or engine)
+    eng = eng or engine
+    if eng.dialect.name == "sqlite":
+        logger.info(
+            "init_db: SQLite backend (%s) — creating schema via "
+            "Base.metadata.create_all",
+            eng.url,
+        )
+        Base.metadata.create_all(eng)
+    else:
+        logger.info(
+            "init_db: non-SQLite backend (%s) — skipping create_all; "
+            "schema is managed by Alembic (run 'alembic upgrade head')",
+            eng.dialect.name,
+        )

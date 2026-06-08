@@ -29,6 +29,7 @@ import abc
 import dataclasses
 from datetime import datetime, timezone
 from typing import Any
+import uuid
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
@@ -43,6 +44,7 @@ from .domain import (
     SessionAggregate,
     SessionExercise,
     TrialRecord,
+    User,
 )
 from .enums import Mode, SessionStatus
 from .models import (
@@ -52,6 +54,7 @@ from .models import (
     SessionExerciseRow,
     SessionRow,
     TrialRow,
+    UserRow,
 )
 
 
@@ -178,8 +181,8 @@ class SqlAlchemySessionRepository(SessionRepository):
         state = agg.engine_state
         row.learner_id = agg.learner_id
         row.module_id = agg.module_id
-        row.mode = agg.mode.value
-        row.status = agg.status.value
+        row.mode = agg.mode
+        row.status = agg.status
         row.created_at = agg.created_at
         row.started_at = agg.started_at
         row.ended_at = agg.ended_at
@@ -265,8 +268,8 @@ class SqlAlchemySessionRepository(SessionRepository):
             id=row.id,
             learner_id=row.learner_id,
             module_id=row.module_id,
-            mode=Mode(row.mode),
-            status=SessionStatus(row.status),
+            mode=row.mode,
+            status=row.status,
             created_at=_as_utc(row.created_at),
             started_at=_as_utc(row.started_at),
             ended_at=_as_utc(row.ended_at) if row.ended_at is not None else None,
@@ -488,8 +491,8 @@ class SqlAlchemySessionRepository(SessionRepository):
                 select(SessionRow)
                 .where(SessionRow.learner_id == learner_id)
                 .where(SessionRow.module_id == module_id)
-                .where(SessionRow.mode == mode.value)
-                .where(SessionRow.status == SessionStatus.COMPLETED.value)
+                .where(SessionRow.mode == mode)
+                .where(SessionRow.status == SessionStatus.COMPLETED)
             )
             if mode is Mode.FASTEST_20:
                 total = db.scalar(
@@ -594,6 +597,32 @@ class LearnerRepository(abc.ABC):
     def save_progress(self, progress: ModuleProgress) -> None:
         """Upsert the learner's per-module progress (θ + mastery)."""
 
+    @abc.abstractmethod
+    def list_progress_modules(self, learner_id: str) -> list[str]:
+        """Return the module ids the learner has any progress on (may be empty)."""
+
+    @abc.abstractmethod
+    def link_learner_to_user(self, learner_id: str, user_id: str) -> None:
+        """Set ``learners.user_id`` for an existing learner.
+
+        Adopts a previously-anonymous learner under an authenticated user. A
+        no-op if the learner does not exist.
+        """
+
+    @abc.abstractmethod
+    def list_learners_for_user(self, user_id: str) -> list[Learner]:
+        """Return all learners owned by ``user_id`` (empty if none)."""
+
+    @abc.abstractmethod
+    def create_learner_for_user(
+        self, user_id: str, now: datetime
+    ) -> Learner:
+        """Mint a new learner already owned by ``user_id`` (atomic create+link).
+
+        Used when an authenticated user has no learner yet: a fresh uuid4-hex
+        learner is created with ``user_id`` set, stamped at ``now``.
+        """
+
 
 class SqlAlchemyLearnerRepository(LearnerRepository):
     """SQLAlchemy 2.0 implementation backed by a :class:`sessionmaker`.
@@ -649,7 +678,11 @@ class SqlAlchemyLearnerRepository(LearnerRepository):
     @staticmethod
     def _learner_row_to_domain(row: LearnerRow) -> Learner:
         """Map a ``learners`` ORM row to a :class:`Learner`."""
-        return Learner(id=row.id, created_at=_as_utc(row.created_at))
+        return Learner(
+            id=row.id,
+            created_at=_as_utc(row.created_at),
+            user_id=row.user_id,
+        )
 
     @classmethod
     def _progress_row_to_domain(
@@ -669,12 +702,23 @@ class SqlAlchemyLearnerRepository(LearnerRepository):
     def get_or_create(self, learner_id: str | None, now: datetime) -> Learner:
         """Return an existing learner, or create one stamped at ``now``."""
         created_at = _as_utc(now)
+        # A client may supply a non-UUID learner_id (e.g. a stale or hand-rolled
+        # value in an anonymous create body). With a native Uuid column a lookup
+        # on such a value raises, so treat anything that is not a valid UUID as a
+        # request to mint a fresh learner rather than 500-ing.
+        valid_id: str | None = None
+        if learner_id is not None:
+            try:
+                uuid.UUID(learner_id)
+                valid_id = learner_id
+            except (ValueError, AttributeError, TypeError):
+                valid_id = None
         with self._session_factory() as db:
-            if learner_id is not None:
-                row = db.get(LearnerRow, learner_id)
+            if valid_id is not None:
+                row = db.get(LearnerRow, valid_id)
                 if row is not None:
                     return self._learner_row_to_domain(row)
-            new_id = learner_id if learner_id is not None else uuid4().hex
+            new_id = valid_id if valid_id is not None else str(uuid4())
             row = LearnerRow(id=new_id, created_at=created_at)
             db.add(row)
             db.commit()
@@ -720,3 +764,134 @@ class SqlAlchemyLearnerRepository(LearnerRepository):
             row.mastery_json = self._mastery_to_json(progress.mastery)
             row.updated_at = _as_utc(progress.updated_at)
             db.commit()
+
+    def list_progress_modules(self, learner_id: str) -> list[str]:
+        """Return the module ids the learner has any progress on."""
+        with self._session_factory() as db:
+            rows = db.scalars(
+                select(LearnerModuleProgressRow.module_id).where(
+                    LearnerModuleProgressRow.learner_id == learner_id
+                )
+            )
+            return list(rows)
+
+    def link_learner_to_user(self, learner_id: str, user_id: str) -> None:
+        """Set ``learners.user_id`` for an existing learner (no-op if absent)."""
+        with self._session_factory() as db:
+            row = db.get(LearnerRow, learner_id)
+            if row is None:
+                return
+            row.user_id = user_id
+            db.commit()
+
+    def list_learners_for_user(self, user_id: str) -> list[Learner]:
+        """Return all learners owned by ``user_id`` (empty if none)."""
+        with self._session_factory() as db:
+            rows = db.scalars(
+                select(LearnerRow).where(LearnerRow.user_id == user_id)
+            )
+            return [self._learner_row_to_domain(r) for r in rows]
+
+    def create_learner_for_user(
+        self, user_id: str, now: datetime
+    ) -> Learner:
+        """Mint a new learner already owned by ``user_id`` (atomic)."""
+        created_at = _as_utc(now)
+        new_id = str(uuid4())
+        with self._session_factory() as db:
+            db.add(
+                LearnerRow(
+                    id=new_id, created_at=created_at, user_id=user_id
+                )
+            )
+            db.commit()
+            return Learner(id=new_id, created_at=created_at, user_id=user_id)
+
+
+class UserRepository(abc.ABC):
+    """Persistence boundary for authenticated user accounts.
+
+    A user (Firebase uid as id) owns zero or more :class:`Learner` rows via the
+    learners' optional ``user_id``. All methods exchange the
+    :class:`~math_practice_backend.domain.User` dataclass only; implementations
+    must not expose ORM rows to callers.
+    """
+
+    @abc.abstractmethod
+    def get(self, user_id: str) -> User | None:
+        """Load a user by id, or ``None`` if it does not exist."""
+
+    @abc.abstractmethod
+    def upsert(self, user: User) -> None:
+        """Insert the user, or update ``email``/``created_at`` if it exists."""
+
+    @abc.abstractmethod
+    def get_or_create(
+        self, user_id: str, email: str | None, now: datetime
+    ) -> User:
+        """Return an existing user, or create one stamped at ``now``.
+
+        When ``user_id`` names an existing user it is returned unchanged.
+        Otherwise a new user is created with the given ``email`` and
+        ``created_at`` taken from the caller's clock (``now``).
+        """
+
+
+class SqlAlchemyUserRepository(UserRepository):
+    """SQLAlchemy 2.0 implementation backed by a :class:`sessionmaker`.
+
+    A fresh :class:`~sqlalchemy.orm.Session` is opened and committed/rolled back
+    per public call, keeping the repository stateless and thread-safe for the
+    shared in-memory engine.
+    """
+
+    def __init__(self, session_factory: sessionmaker) -> None:
+        """Bind the repository to a session factory.
+
+        Args:
+            session_factory: a configured :class:`~sqlalchemy.orm.sessionmaker`
+                bound to the application engine.
+        """
+        self._session_factory = session_factory
+
+    @staticmethod
+    def _user_row_to_domain(row: UserRow) -> User:
+        """Map a ``users`` ORM row to a :class:`User`."""
+        return User(
+            id=row.id,
+            email=row.email,
+            created_at=_as_utc(row.created_at),
+        )
+
+    def get(self, user_id: str) -> User | None:
+        """Load a user by id, or ``None`` if absent."""
+        with self._session_factory() as db:
+            row = db.get(UserRow, user_id)
+            if row is None:
+                return None
+            return self._user_row_to_domain(row)
+
+    def upsert(self, user: User) -> None:
+        """Insert the user, or update ``email``/``created_at`` in place."""
+        with self._session_factory() as db:
+            row = db.get(UserRow, user.id)
+            if row is None:
+                row = UserRow(id=user.id)
+                db.add(row)
+            row.email = user.email
+            row.created_at = _as_utc(user.created_at)
+            db.commit()
+
+    def get_or_create(
+        self, user_id: str, email: str | None, now: datetime
+    ) -> User:
+        """Return an existing user, or create one stamped at ``now``."""
+        created_at = _as_utc(now)
+        with self._session_factory() as db:
+            row = db.get(UserRow, user_id)
+            if row is not None:
+                return self._user_row_to_domain(row)
+            row = UserRow(id=user_id, email=email, created_at=created_at)
+            db.add(row)
+            db.commit()
+            return User(id=user_id, email=email, created_at=created_at)

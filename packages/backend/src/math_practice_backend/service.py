@@ -1,32 +1,34 @@
-"""Session orchestration service (the application/use-case layer).
+"""Application/use-case services for the math-practice backend.
 
-:class:`SessionService` is the single seam between the HTTP layer and the
-persistence + engine layers. It owns the session lifecycle:
+The single session orchestrator has been split into three focused services,
+each receiving the **abstract** repositories (never SQLAlchemy / ORM) plus the
+collaborators it needs:
 
-    * **create** — resolve a module to an :class:`~math_practice.EngineConfig`,
-      seed the engine from the learner's resumable
-      :class:`~math_practice_backend.domain.ModuleProgress` (or cold-start), and
-      persist a new :class:`~math_practice_backend.domain.SessionAggregate` for the
-      chosen ``(module, mode)``.
-    * **load + slide** — every session-scoped operation loads the aggregate,
-      enforces the sliding-TTL expiry, and refreshes ``last_activity_at`` /
-      ``expires_at``.
-    * **next** — honour the mode's stop rule, then draw (or re-show) the pending
-      exercise.
-    * **answer** — honour the mode's late-answer rule, grade op-aware against the
-      server-known result, update the engine, write progress through to
-      :class:`ModuleProgress`, and dual-log a :class:`TrialRecord` (engine trace)
-      and a :class:`SessionExercise` (clean audit row).
-    * **summary** — the run's headline metric, personal best, and per-level
-      mastery; **stats** — the student-safe aggregate projection.
+    * :class:`ProgressService` — owns learner identity and the resumable
+      cross-session :class:`~math_practice_backend.domain.ModuleProgress`:
+      get-or-create the learner, resolve a module to an
+      :class:`~math_practice.EngineConfig`, seed an engine from saved progress (or
+      cold-start), and write progress through after every answer. Wraps the
+      :class:`~math_practice_backend.repositories.LearnerRepository`.
+    * :class:`StatsService` — owns read-only reporting over the ephemeral session:
+      the student-safe aggregate stats, the admin stats tail, the end-of-run
+      summary (headline + personal best + per-level mastery), the current correct
+      streak, and module-completion percent. Wraps the
+      :class:`~math_practice_backend.repositories.SessionRepository`.
+    * :class:`SessionService` — owns the run lifecycle: create (delegating learner
+      + progress seeding to :class:`ProgressService`), draw/​re-show the pending
+      exercise, grade an answer op-aware (delegating progress write-through to
+      :class:`ProgressService`), and the load + sliding-TTL expiry, all guarded by
+      a per-session lock.
 
 A **mode** never changes which exercise the engine selects next (selection is
 always the 85%-comfort softmax); it contributes only a server-enforced stop rule
 and a headline metric, resolved once via :func:`~math_practice_backend.modes.get_mode`
-so the service never branches on a mode string.
+so the services never branch on a mode string.
 
-Everything crossing this boundary is a dataclass; Pydantic lives only at the
-HTTP edge. Mutating operations are guarded by a per-session lock so concurrent
+Everything crossing these boundaries is a dataclass / engine value object;
+Pydantic lives only at the HTTP edge. The mutating operations in
+:class:`SessionService` are guarded by a per-session lock so concurrent
 ``next``/``answer`` calls on one session are serialised.
 """
 
@@ -37,7 +39,7 @@ import random
 import threading
 import uuid
 from dataclasses import fields
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Callable, NamedTuple
 
 from math_practice import (
@@ -120,7 +122,7 @@ class AnswerOutcome(NamedTuple):
 
 
 class SummaryResult(NamedTuple):
-    """End-of-run summary projection returned by :meth:`SessionService.get_summary`.
+    """End-of-run summary projection returned by :meth:`StatsService.get_summary`.
 
     Carries only derived, student-safe signals — the mode's headline metric, the
     personal best and whether this run beat it, and per-level mastery counts. No
@@ -159,7 +161,7 @@ class SummaryResult(NamedTuple):
 
 
 class StatsResult(NamedTuple):
-    """Result bundle returned by :meth:`SessionService.get_stats`.
+    """Result bundle returned by :meth:`StatsService.get_stats`.
 
     Attributes:
         aggregate: the (slid) session aggregate.
@@ -202,161 +204,84 @@ class StudentStats(NamedTuple):
     streak: int
 
 
-class SessionService:
-    """Use-case orchestration for practice sessions.
+def _progress_from_state(state: EngineState) -> Progress:
+    """Build a :class:`Progress` from an :class:`EngineState`.
 
-    Wires a :class:`~math_practice_backend.repositories.SessionRepository`, a
-    :class:`~math_practice_backend.repositories.LearnerRepository`, a
-    :class:`~math_practice_backend.clock.Clock`, a sliding TTL, and an RNG factory
-    into the session lifecycle. The session repository owns the ephemeral 24h
-    aggregate (plus its trial and audit logs); the learner repository owns the
-    permanent learner identity and the resumable per-(learner, module) progress
-    the service seeds from and writes through on every answer. The service is
-    stateless except for a lazily-built table of per-session locks; all durable
-    state lives in the repositories.
+    Reading mastery off the persisted :class:`EngineState` avoids the cost of
+    rehydrating an engine just to count mastered items.
+
+    Args:
+        state: the session's restorable engine snapshot.
+
+    Returns:
+        The :class:`Progress` projection.
+    """
+    total = len(state.mastery)
+    mastered_count = sum(1 for m in state.mastery if m.mastered)
+    return Progress(
+        theta=state.theta,
+        mastered_count=mastered_count,
+        total=total,
+        all_mastered=total > 0 and mastered_count >= total,
+    )
+
+
+def progress(agg: SessionAggregate) -> Progress:
+    """Compute progress directly from an aggregate's engine state.
+
+    Args:
+        agg: the session aggregate.
+
+    Returns:
+        The :class:`Progress` projection.
+    """
+    return _progress_from_state(agg.engine_state)
+
+
+def module_completion_percent(agg: SessionAggregate) -> float:
+    """Percent of curriculum exercises mastered for a session.
+
+    Derived from :func:`progress`: ``mastered_count / total * 100``. Returns
+    ``0.0`` when the curriculum is empty (``total == 0``).
+
+    Args:
+        agg: the session aggregate.
+
+    Returns:
+        The completion percentage in ``[0.0, 100.0]``.
+    """
+    p = progress(agg)
+    if p.total == 0:
+        return 0.0
+    return p.mastered_count / p.total * 100.0
+
+
+class ProgressService:
+    """Learner identity + cross-session progress.
+
+    Wraps the :class:`~math_practice_backend.repositories.LearnerRepository` — the
+    permanent learner identity and the resumable per-(learner, module) progress.
+    Owns resolving a module to an :class:`~math_practice.EngineConfig`, minting /
+    resolving a learner, seeding a fresh :class:`~math_practice.PracticeEngine`
+    from saved progress (or cold-start), and the write-through that persists θ +
+    mastery after every answer so progress survives an abandoned session.
     """
 
     def __init__(
         self,
-        repo: SessionRepository,
         learner_repo: LearnerRepository,
-        clock: Clock,
-        ttl: timedelta,
         rng_factory: Callable[[], random.Random] = lambda: random.Random(),
     ) -> None:
         """Build the service.
 
         Args:
-            repo:         the session persistence boundary (ephemeral aggregate +
-                logs).
             learner_repo: the learner/module-progress persistence boundary
                 (permanent identity + resumable progress).
-            clock:        source of aware-UTC "now".
-            ttl:          sliding retention window; ``expires_at = now + ttl``.
             rng_factory:  factory producing a fresh :class:`random.Random` for
                 each engine rehydration (kept injectable for determinism).
         """
-        self._repo = repo
         self._learner_repo = learner_repo
-        self._clock = clock
-        self._ttl = ttl
         self._rng_factory = rng_factory
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
-
-    # ----- locking ----------------------------------------------------------
-
-    def _lock_for(self, sid: str) -> threading.Lock:
-        """Return the per-session lock for ``sid``, creating it on first use."""
-        with self._locks_guard:
-            lock = self._locks.get(sid)
-            if lock is None:
-                lock = threading.Lock()
-                self._locks[sid] = lock
-            return lock
-
-    # ----- progress helpers -------------------------------------------------
-
-    @staticmethod
-    def progress(agg: SessionAggregate) -> Progress:
-        """Compute progress directly from an aggregate's engine state.
-
-        Reading mastery off the persisted :class:`EngineState` avoids the cost
-        of rehydrating an engine just to count mastered items.
-
-        Args:
-            agg: the session aggregate.
-
-        Returns:
-            The :class:`Progress` projection.
-        """
-        return SessionService._progress_from_state(agg.engine_state)
-
-    @staticmethod
-    def _progress_from_state(state: EngineState) -> Progress:
-        """Build a :class:`Progress` from an :class:`EngineState`."""
-        total = len(state.mastery)
-        mastered_count = sum(1 for m in state.mastery if m.mastered)
-        return Progress(
-            theta=state.theta,
-            mastered_count=mastered_count,
-            total=total,
-            all_mastered=total > 0 and mastered_count >= total,
-        )
-
-    # ----- student-safe projections -----------------------------------------
-
-    @staticmethod
-    def module_completion_percent(agg: SessionAggregate) -> float:
-        """Percent of curriculum exercises mastered for a session.
-
-        Derived from :meth:`progress`: ``mastered_count / total * 100``. Returns
-        ``0.0`` when the curriculum is empty (``total == 0``).
-
-        Args:
-            agg: the session aggregate.
-
-        Returns:
-            The completion percentage in ``[0.0, 100.0]``.
-        """
-        p = SessionService.progress(agg)
-        if p.total == 0:
-            return 0.0
-        return p.mastered_count / p.total * 100.0
-
-    def current_streak(self, sid: str) -> int:
-        """Count consecutive correct answers ending at the most recent trial.
-
-        Walks the trial log newest-first and counts how many leading trials are
-        correct, stopping at the first wrong answer. Returns ``0`` when the most
-        recent trial is wrong or there are no trials.
-
-        Args:
-            sid: the session id.
-
-        Returns:
-            The current correct-answer streak.
-        """
-        streak = 0
-        for trial in self._repo.list_trials(sid):
-            if not trial.correct:
-                break
-            streak += 1
-        return streak
-
-    def get_student_stats(self, sid: str) -> StudentStats:
-        """Return the student-safe aggregate statistics for a session.
-
-        Loads and slides the session (persisting the slide), then computes the
-        learner-facing surface metrics without leaking any engine internals.
-
-        Args:
-            sid: the session id.
-
-        Returns:
-            A :class:`StudentStats` projection.
-
-        Raises:
-            SessionNotFound: if no such session exists.
-            SessionExpired:  if the session has expired.
-        """
-        agg = self._load(sid, persist_slide=True)
-        done = self._repo.count_trials(sid)
-        correct = self._repo.correct_count(sid)
-        total_time = self._repo.sum_response_time(sid)
-        accuracy = (correct / done) if done > 0 else 0.0
-        avg_time = (total_time / done) if done > 0 else 0.0
-        return StudentStats(
-            questions_done=done,
-            correct=correct,
-            accuracy=accuracy,
-            total_time_seconds=total_time,
-            avg_time_seconds=avg_time,
-            module_completion_percent=self.module_completion_percent(agg),
-            streak=self.current_streak(sid),
-        )
-
-    # ----- config building --------------------------------------------------
 
     @staticmethod
     def build_module_config(
@@ -442,6 +367,321 @@ class SessionService:
             raise InvalidConfig("Config field 'range_bound' must be >= 2")
         return config
 
+    def resolve_learner(self, learner_id: str | None, now):
+        """Return an existing learner, or mint a new one stamped at ``now``.
+
+        Args:
+            learner_id: the owning learner's id, or ``None`` to mint a new one.
+            now:        the aware-UTC creation timestamp for a new learner.
+
+        Returns:
+            The resolved :class:`~math_practice_backend.domain.Learner`.
+        """
+        return self._learner_repo.get_or_create(learner_id, now)
+
+    def seed_engine(
+        self, learner_id: str, module_id: str, config: EngineConfig
+    ) -> PracticeEngine:
+        """Build the run's engine, seeding from saved progress when present.
+
+        If the learner has resumable :class:`ModuleProgress` for ``module_id``,
+        the engine is rehydrated from that θ + mastery (so progress carries over);
+        otherwise it cold-starts on the given config.
+
+        Args:
+            learner_id: the owning learner's id.
+            module_id:  the module being practiced.
+            config:     the resolved :class:`EngineConfig`.
+
+        Returns:
+            A ready :class:`~math_practice.PracticeEngine`.
+        """
+        saved = self._learner_repo.get_progress(learner_id, module_id)
+        if saved is not None:
+            state = EngineState(
+                theta=saved.theta,
+                config=config,
+                mastery=saved.mastery,
+                last_shown=None,
+            )
+            return PracticeEngine.from_state(state, rng=self._rng_factory())
+        return PracticeEngine(config=config, rng=self._rng_factory())
+
+    def save_progress(self, agg: SessionAggregate, now) -> None:
+        """Write θ + mastery through to :class:`ModuleProgress` for the run.
+
+        Persists the aggregate's current engine state under
+        ``(learner_id, module_id)`` so progress survives an abandoned session and
+        seeds the next run for this (learner, module).
+
+        Args:
+            agg: the session aggregate whose engine state to persist.
+            now: the aware-UTC update timestamp.
+        """
+        self._learner_repo.save_progress(
+            ModuleProgress(
+                learner_id=agg.learner_id,
+                module_id=agg.module_id,
+                theta=agg.engine_state.theta,
+                mastery=agg.engine_state.mastery,
+                updated_at=now,
+            )
+        )
+
+
+class StatsService:
+    """Read-only reporting over the ephemeral session.
+
+    Wraps the :class:`~math_practice_backend.repositories.SessionRepository` and
+    produces the student-safe and admin projections: aggregate stats, the recent
+    trial tail, the end-of-run summary (headline + personal best + per-level
+    mastery), the current correct streak, and module-completion percent. It never
+    mutates session state (the activity slide is owned by
+    :class:`SessionService`); callers that need a slid aggregate load it through
+    :class:`SessionService` first.
+    """
+
+    def __init__(self, repo: SessionRepository, rng_factory: Callable[[], random.Random] = lambda: random.Random()) -> None:
+        """Build the service.
+
+        Args:
+            repo:        the session persistence boundary (ephemeral aggregate +
+                logs).
+            rng_factory: factory producing a fresh :class:`random.Random` for the
+                engine rehydration used to read per-level mastery in the summary.
+        """
+        self._repo = repo
+        self._rng_factory = rng_factory
+
+    @staticmethod
+    def progress(agg: SessionAggregate) -> Progress:
+        """Compute progress directly from an aggregate's engine state."""
+        return progress(agg)
+
+    @staticmethod
+    def module_completion_percent(agg: SessionAggregate) -> float:
+        """Percent of curriculum exercises mastered for a session."""
+        return module_completion_percent(agg)
+
+    def current_streak(self, sid: str) -> int:
+        """Count consecutive correct answers ending at the most recent trial.
+
+        Walks the trial log newest-first and counts how many leading trials are
+        correct, stopping at the first wrong answer. Returns ``0`` when the most
+        recent trial is wrong or there are no trials.
+
+        Args:
+            sid: the session id.
+
+        Returns:
+            The current correct-answer streak.
+        """
+        streak = 0
+        for trial in self._repo.list_trials(sid):
+            if not trial.correct:
+                break
+            streak += 1
+        return streak
+
+    def get_student_stats(self, agg: SessionAggregate) -> StudentStats:
+        """Return the student-safe aggregate statistics for a session.
+
+        Computes the learner-facing surface metrics without leaking any engine
+        internals. The aggregate is supplied already loaded + slid by
+        :class:`SessionService` so this service stays read-only.
+
+        Args:
+            agg: the (slid) session aggregate.
+
+        Returns:
+            A :class:`StudentStats` projection.
+        """
+        sid = agg.id
+        done = self._repo.count_trials(sid)
+        correct = self._repo.correct_count(sid)
+        total_time = self._repo.sum_response_time(sid)
+        accuracy = (correct / done) if done > 0 else 0.0
+        avg_time = (total_time / done) if done > 0 else 0.0
+        return StudentStats(
+            questions_done=done,
+            correct=correct,
+            accuracy=accuracy,
+            total_time_seconds=total_time,
+            avg_time_seconds=avg_time,
+            module_completion_percent=module_completion_percent(agg),
+            streak=self.current_streak(sid),
+        )
+
+    def get_summary(self, agg: SessionAggregate) -> SummaryResult:
+        """Return the run's student-safe end-of-run summary.
+
+        Rehydrates an engine from the snapshot purely to read per-level mastery,
+        and compares the run's headline against the learner's personal best for
+        this ``(module, mode)``. The "new best" comparison is mode-aware: smaller
+        is better for the time-based Fastest-20 best, larger for the count-based
+        3-minute best; Endless has no best so ``is_new_best`` is always ``False``.
+
+        Args:
+            agg: the (slid) session aggregate.
+
+        Returns:
+            A :class:`SummaryResult` (headline, personal best, per-level mastery).
+        """
+        mode = get_mode(agg.mode)
+
+        engine = PracticeEngine.from_state(
+            agg.engine_state, rng=self._rng_factory()
+        )
+        level_progress = [
+            LevelProgress(level=level, mastered=mastered, total=total)
+            for level, (mastered, total) in sorted(
+                engine.level_progress().items()
+            )
+        ]
+
+        done = agg.questions_done
+        accuracy = (agg.correct_count / done) if done > 0 else 0.0
+        avg_time = (agg.total_time / done) if done > 0 else 0.0
+
+        best = self._repo.best_result(agg.learner_id, agg.module_id, agg.mode)
+        headline = mode.headline(agg)
+        is_new_best = self._is_new_best(agg.mode, headline, best)
+
+        return SummaryResult(
+            module_id=agg.module_id,
+            label=get_module(agg.module_id).label,
+            mode=agg.mode,
+            status=agg.status,
+            questions_done=done,
+            correct_count=agg.correct_count,
+            accuracy=accuracy,
+            total_time=agg.total_time,
+            avg_time=avg_time,
+            headline=headline,
+            best=best,
+            is_new_best=is_new_best,
+            level_progress=level_progress,
+        )
+
+    @staticmethod
+    def _is_new_best(
+        mode: Mode, headline: dict, best: float | int | None
+    ) -> bool:
+        """Compare a run's headline against the personal best for its mode.
+
+        Fastest-20 is time-based (lower is better); 3-minute is count-based
+        (higher is better); Endless has no best. A ``None`` best (no prior
+        qualifying session, or a mode without a best) means this run is the best
+        only for the modes that *have* one.
+
+        Args:
+            mode:     the practice mode.
+            headline: the run's headline-metric payload.
+            best:     the personal best over prior completed sessions, if any.
+
+        Returns:
+            ``True`` when this run set a new personal best.
+        """
+        if mode is Mode.FASTEST_20:
+            value = headline.get("total_time_seconds")
+            if value is None:
+                return False
+            return best is None or value < best
+        if mode is Mode.THREE_MINUTE:
+            value = headline.get("questions_done")
+            if value is None:
+                return False
+            return best is None or value > best
+        return False
+
+    def get_stats(self, agg: SessionAggregate) -> StatsResult:
+        """Return aggregate progress plus the recent trial log for a session.
+
+        Queries trial counts and the most recent trials for the supplied (slid)
+        aggregate.
+
+        Args:
+            agg: the (slid) session aggregate.
+
+        Returns:
+            A :class:`StatsResult` bundling the aggregate, progress, totals, and
+            the most recent trials (newest-first, capped at 20).
+        """
+        sid = agg.id
+        trials = self._repo.count_trials(sid)
+        correct = self._repo.correct_count(sid)
+        recent = self._repo.list_trials(sid, limit=20)
+        return StatsResult(
+            aggregate=agg,
+            progress=progress(agg),
+            trials=trials,
+            correct=correct,
+            recent=recent,
+        )
+
+
+class SessionService:
+    """Use-case orchestration for the practice-run lifecycle.
+
+    Wires a :class:`~math_practice_backend.repositories.SessionRepository` (the
+    ephemeral 24h aggregate plus its trial and audit logs), a
+    :class:`ProgressService` (learner identity + resumable progress), a
+    :class:`~math_practice_backend.clock.Clock`, a sliding TTL, and an RNG factory
+    into the session lifecycle. The service is stateless except for a lazily-built
+    table of per-session locks; all durable state lives in the repositories.
+    """
+
+    def __init__(
+        self,
+        repo: SessionRepository,
+        progress_service: ProgressService,
+        clock: Clock,
+        ttl: timedelta,
+        rng_factory: Callable[[], random.Random] = lambda: random.Random(),
+    ) -> None:
+        """Build the service.
+
+        Args:
+            repo:             the session persistence boundary (ephemeral
+                aggregate + logs).
+            progress_service: the learner-identity + cross-session progress
+                service the lifecycle delegates seeding and write-through to.
+            clock:            source of aware-UTC "now".
+            ttl:              sliding retention window; ``expires_at = now + ttl``.
+            rng_factory:      factory producing a fresh :class:`random.Random` for
+                each engine rehydration (kept injectable for determinism).
+        """
+        self._repo = repo
+        self._progress = progress_service
+        self._clock = clock
+        self._ttl = ttl
+        self._rng_factory = rng_factory
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    # ----- locking ----------------------------------------------------------
+
+    def _lock_for(self, sid: str) -> threading.Lock:
+        """Return the per-session lock for ``sid``, creating it on first use."""
+        with self._locks_guard:
+            lock = self._locks.get(sid)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[sid] = lock
+            return lock
+
+    # ----- progress helpers (kept for back-compat) --------------------------
+
+    @staticmethod
+    def progress(agg: SessionAggregate) -> Progress:
+        """Compute progress directly from an aggregate's engine state."""
+        return progress(agg)
+
+    @staticmethod
+    def module_completion_percent(agg: SessionAggregate) -> float:
+        """Percent of curriculum exercises mastered for a session."""
+        return module_completion_percent(agg)
+
     # ----- load / expiry / slide -------------------------------------------
 
     def _load(self, sid: str, *, persist_slide: bool = False) -> SessionAggregate:
@@ -494,11 +734,11 @@ class SessionService:
     ) -> SessionAggregate:
         """Create and persist a brand-new practice run for a ``(module, mode)``.
 
-        Resolves (or mints) the learner, builds the module's
-        :class:`EngineConfig`, and seeds a fresh
+        Delegates to :class:`ProgressService` to resolve (or mint) the learner,
+        build the module's :class:`EngineConfig`, and seed a fresh
         :class:`~math_practice.PracticeEngine` from the learner's resumable
         :class:`ModuleProgress` for that module if present (so θ + mastery carry
-        over), else cold-starts. The engine snapshot, the mode's stop-rule targets
+        over), else cold-start. The engine snapshot, the mode's stop-rule targets
         (``target_count`` / ``target_seconds``), and ``started_at == created_at``
         (so a timed mode's deadline is known at creation) are recorded on a new
         ``ACTIVE`` aggregate with a uuid4-hex id.
@@ -518,24 +758,13 @@ class SessionService:
             UnknownMode:    if ``mode`` is not a registered practice mode.
         """
         now = self._clock.now()
-        learner = self._learner_repo.get_or_create(learner_id, now)
-        config = self.build_module_config(module_id, overrides)
-
-        progress = self._learner_repo.get_progress(learner.id, module_id)
-        if progress is not None:
-            state = EngineState(
-                theta=progress.theta,
-                config=config,
-                mastery=progress.mastery,
-                last_shown=None,
-            )
-            engine = PracticeEngine.from_state(state, rng=self._rng_factory())
-        else:
-            engine = PracticeEngine(config=config, rng=self._rng_factory())
+        learner = self._progress.resolve_learner(learner_id, now)
+        config = self._progress.build_module_config(module_id, overrides)
+        engine = self._progress.seed_engine(learner.id, module_id, config)
 
         mode_strategy = get_mode(mode)
         agg = SessionAggregate(
-            id=uuid.uuid4().hex,
+            id=str(uuid.uuid4()),
             learner_id=learner.id,
             module_id=module_id,
             mode=mode,
@@ -647,9 +876,9 @@ class SessionService:
         :class:`TrialRecord` and a clean :class:`SessionExercise` audit row. The
         denormalized metrics, engine snapshot, and bumped ``trial_seq`` are
         updated and the pending exercise cleared. Progress is **written through**
-        to :class:`ModuleProgress` so it survives an abandoned session, and the
-        mode's stop rule is re-evaluated to set ``COMPLETED`` when this answer
-        ends the run.
+        to :class:`ModuleProgress` (via :class:`ProgressService`) so it survives
+        an abandoned session, and the mode's stop rule is re-evaluated to set
+        ``COMPLETED`` when this answer ends the run.
 
         Args:
             sid:     the session id.
@@ -730,15 +959,7 @@ class SessionService:
 
             # Write-through: persist θ + mastery so progress survives an
             # abandoned session and seeds the next run for this (learner, module).
-            self._learner_repo.save_progress(
-                ModuleProgress(
-                    learner_id=agg.learner_id,
-                    module_id=agg.module_id,
-                    theta=agg.engine_state.theta,
-                    mastery=agg.engine_state.mastery,
-                    updated_at=now,
-                )
-            )
+            self._progress.save_progress(agg, now)
 
             finished = mode.is_complete(agg, now)
             if finished:
@@ -759,124 +980,7 @@ class SessionService:
             return AnswerOutcome(
                 trial=trial,
                 mastery=mastery,
-                progress=self._progress_from_state(agg.engine_state),
+                progress=_progress_from_state(agg.engine_state),
                 finished=finished,
                 remaining=mode.remaining(agg, now),
             )
-
-    def get_summary(self, sid: str) -> SummaryResult:
-        """Return the run's student-safe end-of-run summary.
-
-        Loads and slides the session (persisting the slide), rehydrates an engine
-        from the snapshot purely to read per-level mastery, and compares the run's
-        headline against the learner's personal best for this
-        ``(module, mode)``. The "new best" comparison is mode-aware: smaller is
-        better for the time-based Fastest-20 best, larger for the count-based
-        3-minute best; Endless has no best so ``is_new_best`` is always ``False``.
-
-        Args:
-            sid: the session id.
-
-        Returns:
-            A :class:`SummaryResult` (headline, personal best, per-level mastery).
-
-        Raises:
-            SessionNotFound: if no such session exists.
-            SessionExpired:  if the session has expired.
-        """
-        agg = self._load(sid, persist_slide=True)
-        mode = get_mode(agg.mode)
-
-        engine = PracticeEngine.from_state(
-            agg.engine_state, rng=self._rng_factory()
-        )
-        level_progress = [
-            LevelProgress(level=level, mastered=mastered, total=total)
-            for level, (mastered, total) in sorted(
-                engine.level_progress().items()
-            )
-        ]
-
-        done = agg.questions_done
-        accuracy = (agg.correct_count / done) if done > 0 else 0.0
-        avg_time = (agg.total_time / done) if done > 0 else 0.0
-
-        best = self._repo.best_result(agg.learner_id, agg.module_id, agg.mode)
-        headline = mode.headline(agg)
-        is_new_best = self._is_new_best(agg.mode, headline, best)
-
-        return SummaryResult(
-            module_id=agg.module_id,
-            label=get_module(agg.module_id).label,
-            mode=agg.mode,
-            status=agg.status,
-            questions_done=done,
-            correct_count=agg.correct_count,
-            accuracy=accuracy,
-            total_time=agg.total_time,
-            avg_time=avg_time,
-            headline=headline,
-            best=best,
-            is_new_best=is_new_best,
-            level_progress=level_progress,
-        )
-
-    @staticmethod
-    def _is_new_best(
-        mode: Mode, headline: dict, best: float | int | None
-    ) -> bool:
-        """Compare a run's headline against the personal best for its mode.
-
-        Fastest-20 is time-based (lower is better); 3-minute is count-based
-        (higher is better); Endless has no best. A ``None`` best (no prior
-        qualifying session, or a mode without a best) means this run is the best
-        only for the modes that *have* one.
-
-        Args:
-            mode:     the practice mode.
-            headline: the run's headline-metric payload.
-            best:     the personal best over prior completed sessions, if any.
-
-        Returns:
-            ``True`` when this run set a new personal best.
-        """
-        if mode is Mode.FASTEST_20:
-            value = headline.get("total_time_seconds")
-            if value is None:
-                return False
-            return best is None or value < best
-        if mode is Mode.THREE_MINUTE:
-            value = headline.get("questions_done")
-            if value is None:
-                return False
-            return best is None or value > best
-        return False
-
-    def get_stats(self, sid: str) -> StatsResult:
-        """Return aggregate progress plus the recent trial log for a session.
-
-        Loads and slides the session (persisting the slide), then queries trial
-        counts and the most recent trials.
-
-        Args:
-            sid: the session id.
-
-        Returns:
-            A :class:`StatsResult` bundling the aggregate, progress, totals, and
-            the most recent trials (newest-first, capped at 20).
-
-        Raises:
-            SessionNotFound: if no such session exists.
-            SessionExpired:  if the session has expired.
-        """
-        agg = self._load(sid, persist_slide=True)
-        trials = self._repo.count_trials(sid)
-        correct = self._repo.correct_count(sid)
-        recent = self._repo.list_trials(sid, limit=20)
-        return StatsResult(
-            aggregate=agg,
-            progress=self.progress(agg),
-            trials=trials,
-            correct=correct,
-            recent=recent,
-        )

@@ -32,13 +32,24 @@ from fastapi import APIRouter, Depends, status
 from math_practice import MODULES
 
 from . import mappers
-from .dependencies import get_service
+from .auth import AuthIdentity
+from .dependencies import (
+    get_identity_service,
+    get_optional_identity,
+    get_required_identity,
+    get_service,
+    get_stats_service,
+)
 from .enums import Mode
 from .errors import UnknownMode
+from .identity_service import IdentityService
 from .schemas import (
     AnswerIn,
+    ClaimIn,
+    ClaimOut,
     CreateStudentSessionIn,
     ExerciseOut,
+    MeOut,
     ModeOut,
     ModuleOut,
     StudentAnswerOut,
@@ -46,7 +57,7 @@ from .schemas import (
     StudentStatsOut,
     StudentSummaryOut,
 )
-from .service import SessionService
+from .service import SessionService, StatsService
 
 router = APIRouter(prefix="/v1/play", tags=["play"])
 
@@ -137,8 +148,14 @@ async def list_modes() -> list[ModeOut]:
 async def create_play_session(
     body: CreateStudentSessionIn,
     service: SessionService = Depends(get_service),
+    identity: AuthIdentity | None = Depends(get_optional_identity),
+    identity_service: IdentityService = Depends(get_identity_service),
 ) -> StudentSessionOut:
     """Create a play session for a ``(module, mode)``, minting a learner if needed.
+
+    When a valid ``Authorization: Bearer <token>`` is present the server resolves
+    the *user's* learner and uses it, ignoring ``body.learner_id``. Otherwise the
+    run is anonymous: ``body.learner_id`` is resumed (or a fresh learner minted).
 
     Returns the identity the client persists (``session_id`` + ``learner_id``),
     the chosen module/mode, the 24h expiry, and the mode's stop-rule parameters
@@ -146,8 +163,13 @@ async def create_play_session(
     internals are exposed.
     """
     mode = _parse_mode(body.mode)
+    if identity is not None:
+        learner = identity_service.resolve_learner(identity)
+        learner_id = learner.id
+    else:
+        learner_id = body.learner_id
     agg = service.create_session(
-        learner_id=body.learner_id,
+        learner_id=learner_id,
         module_id=body.module_id,
         mode=mode,
         overrides=None,
@@ -163,6 +185,44 @@ async def create_play_session(
         target_seconds=agg.target_seconds,
         deadline=_deadline_for(agg),
     )
+
+
+@router.get(
+    "/me",
+    response_model=MeOut,
+)
+async def play_me(
+    identity: AuthIdentity = Depends(get_required_identity),
+    identity_service: IdentityService = Depends(get_identity_service),
+) -> MeOut:
+    """Return the signed-in user's account learner id and email.
+
+    Requires a valid ``Authorization: Bearer <token>`` (else ``401``). Resolves
+    (creating on first sight) the user's single learner.
+    """
+    learner = identity_service.resolve_learner(identity)
+    return MeOut(learner_id=learner.id, email=identity.email)
+
+
+@router.post(
+    "/claim",
+    response_model=ClaimOut,
+)
+async def play_claim(
+    body: ClaimIn,
+    identity: AuthIdentity = Depends(get_required_identity),
+    identity_service: IdentityService = Depends(get_identity_service),
+) -> ClaimOut:
+    """Fold an anonymous learner's progress into the signed-in user's learner.
+
+    Requires a valid token (else ``401``). Adopts the anonymous learner if the
+    user has none yet, else merges its per-module progress keeping the
+    more-advanced state. Returns the user's learner id.
+    """
+    learner = identity_service.claim_anonymous(
+        identity, body.anonymous_learner_id
+    )
+    return ClaimOut(learner_id=learner.id)
 
 
 @router.post(
@@ -190,6 +250,7 @@ async def play_answer(
     sid: str,
     body: AnswerIn,
     service: SessionService = Depends(get_service),
+    stats_service: StatsService = Depends(get_stats_service),
 ) -> StudentAnswerOut:
     """Grade an answer and return the freshly-recomputed surface metrics.
 
@@ -200,7 +261,8 @@ async def play_answer(
     internals leak.
     """
     outcome = service.submit_answer(sid, body.answer, body.elapsed_seconds)
-    stats = service.get_student_stats(sid)
+    agg = service.get_session(sid)
+    stats = stats_service.get_student_stats(agg)
     return StudentAnswerOut(
         correct=outcome.trial.correct,
         questions_done=stats.questions_done,
@@ -219,9 +281,11 @@ async def play_answer(
 async def play_summary(
     sid: str,
     service: SessionService = Depends(get_service),
+    stats_service: StatsService = Depends(get_stats_service),
 ) -> StudentSummaryOut:
     """Return the run's headline metric, personal best, and per-level mastery."""
-    summary = service.get_summary(sid)
+    agg = service.get_session(sid)
+    summary = stats_service.get_summary(agg)
     return mappers.summary_to_out(summary)
 
 
@@ -232,9 +296,11 @@ async def play_summary(
 async def play_stats(
     sid: str,
     service: SessionService = Depends(get_service),
+    stats_service: StatsService = Depends(get_stats_service),
 ) -> StudentStatsOut:
     """Return student-safe aggregate statistics (counts, timing, streak)."""
-    stats = service.get_student_stats(sid)
+    agg = service.get_session(sid)
+    stats = stats_service.get_student_stats(agg)
     return StudentStatsOut(
         questions_done=stats.questions_done,
         correct=stats.correct,

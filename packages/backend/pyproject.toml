@@ -7,14 +7,18 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "sqlalchemy>=2.0",
+    "alembic",
     "pydantic>=2",
     "pydantic-settings",
     "httpx",
+    "google-auth",
+    "requests",
     "math-practice",
 ]
 
 [project.optional-dependencies]
-dev = ["httpx", "pytest"]
+dev = ["httpx", "pytest", "testcontainers"]
+postgres = ["psycopg[binary]"]
 
 [build-system]
 requires = ["hatchling"]

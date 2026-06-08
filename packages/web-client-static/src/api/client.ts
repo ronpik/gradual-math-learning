@@ -11,7 +11,9 @@
 
 import type {
   AnswerResult,
+  ClaimResult,
   Exercise,
+  Me,
   ModeDescriptor,
   ModuleDescriptor,
   StudentSession,
@@ -46,19 +48,67 @@ function resolveBase(): string {
 
 const BASE = resolveBase();
 
+/**
+ * Module-level Firebase ID token. `null` means anonymous play (no Authorization
+ * header). `setAuthToken` is called by the auth flow on sign-in/out and after a
+ * forced token refresh.
+ */
+let authToken: string | null = null;
+
+/** Set (or clear, with `null`) the bearer token attached to every request. */
+export function setAuthToken(token: string | null): void {
+  authToken = token;
+}
+
+/**
+ * Optional token-refresh hook. When set (by the auth layer to
+ * `() => getIdToken(true)`), a request that gets a `401` will refresh the token
+ * once and retry. Kept as an injected callback so this module stays free of any
+ * Firebase import.
+ */
+let refreshToken: (() => Promise<string | null>) | null = null;
+
+/** Register (or clear) the forced-refresh callback used on a 401. */
+export function setTokenRefresher(
+  fn: (() => Promise<string | null>) | null,
+): void {
+  refreshToken = fn;
+}
+
+async function send(path: string, init: RequestInit | undefined): Promise<Response> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  if (authToken) {
+    headers["Authorization"] = `Bearer ${authToken}`;
+  }
+  return fetch(`${BASE}${path}`, { ...init, headers });
+}
+
 async function request<T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
-      ...init,
-    });
+    response = await send(path, init);
   } catch {
     // Network / CORS failure — surface as a status-0 ApiError.
     throw new ApiError(0, `Network request to ${path} failed`);
+  }
+
+  // On a 401 while authed, refresh the token once and retry.
+  if (response.status === 401 && authToken && refreshToken) {
+    const fresh = await refreshToken();
+    if (fresh) {
+      authToken = fresh;
+      try {
+        response = await send(path, init);
+      } catch {
+        throw new ApiError(0, `Network request to ${path} failed`);
+      }
+    }
   }
 
   if (!response.ok) {
@@ -155,4 +205,26 @@ export function getStats(sid: string): Promise<StudentStats> {
     `/v1/play/sessions/${encodeURIComponent(sid)}/stats`,
     { method: "GET" },
   );
+}
+
+/**
+ * Resolve the signed-in user's identity (their account learner + email).
+ * Requires a valid auth token; a 401 surfaces as `ApiError(401)`.
+ */
+export function getMe(): Promise<Me> {
+  return request<Me>("/v1/play/me", { method: "GET" });
+}
+
+/**
+ * Merge an anonymous learner's progress into the signed-in user's learner and
+ * return the user's learner id. Requires a valid auth token. Idempotent on the
+ * server, so the client may call it once per sign-in safely.
+ */
+export function claimAnonymous(
+  anonymousLearnerId: string,
+): Promise<ClaimResult> {
+  return request<ClaimResult>("/v1/play/claim", {
+    method: "POST",
+    body: JSON.stringify({ anonymous_learner_id: anonymousLearnerId }),
+  });
 }

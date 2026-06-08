@@ -13,6 +13,7 @@ Service-layer error mapping:
     * :class:`SessionComplete`   -> 409
     * :class:`ModuleNotFound`    -> 404
     * :class:`UnknownMode`       -> 422
+    * :class:`AuthError`         -> 401
 
 All error responses share the shape ``{"detail": <message>}``.
 """
@@ -29,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .auth import AuthError
 from .db import init_db
 from .dependencies import get_clock, get_repository, get_service
 from .errors import (
@@ -50,14 +52,25 @@ from .sweeper import sweeper_loop
 def _resolve_web_dir(settings: Settings) -> Path:
     """Resolve the directory holding the built static web client.
 
-    Honours ``settings.web_dir`` when set; otherwise defaults to
-    ``<repo_root>/packages/web-client-static/dist`` where ``repo_root`` is four
-    parents above this module.
+    Honours ``settings.web_dir`` when set. Otherwise searches upward from both
+    the current working directory and this module's location for a
+    ``packages/web-client-static/dist`` directory. This works whether the
+    backend is installed editable (``app.py`` under ``packages/backend/src``) or
+    as a wheel (``app.py`` under ``site-packages``); production should set
+    ``MATH_PRACTICE_WEB_DIR`` explicitly.
     """
     if settings.web_dir is not None:
         return Path(settings.web_dir)
-    repo_root = Path(__file__).resolve().parents[4]
-    return repo_root / "packages" / "web-client-static" / "dist"
+
+    rel = Path("packages") / "web-client-static" / "dist"
+    starts = [Path.cwd(), Path(__file__).resolve().parent]
+    for start in starts:
+        for base in (start, *start.parents):
+            candidate = base / rel
+            if candidate.is_dir():
+                return candidate
+    # Fall back to a cwd-relative path (non-existent -> mount skipped silently).
+    return Path.cwd() / rel
 
 
 @asynccontextmanager
@@ -185,6 +198,14 @@ async def _handle_unknown_mode(
 ) -> JSONResponse:
     """Map :class:`UnknownMode` to ``422 Unprocessable Entity``."""
     return _error_response(422, exc.message)
+
+
+@app.exception_handler(AuthError)
+async def _handle_auth_error(
+    request: Request, exc: AuthError
+) -> JSONResponse:
+    """Map :class:`AuthError` to ``401 Unauthorized``."""
+    return _error_response(401, exc.message)
 
 
 @app.exception_handler(ServiceError)

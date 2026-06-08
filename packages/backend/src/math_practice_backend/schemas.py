@@ -226,6 +226,34 @@ class CreateStudentSessionIn(BaseModel):
     mode: str
 
 
+class MeOut(BaseModel):
+    """The authenticated user's identity + their account learner.
+
+    Returned by ``GET /v1/play/me``. Carries the durable ``learner_id`` the
+    client plays as once signed in, and the user's email (if known). No engine
+    internals.
+    """
+
+    learner_id: str
+    email: str | None = None
+
+
+class ClaimIn(BaseModel):
+    """Request body for ``POST /v1/play/claim``.
+
+    Names the anonymous (localStorage) learner whose cross-session progress
+    should be folded into the authenticated user's account learner.
+    """
+
+    anonymous_learner_id: str
+
+
+class ClaimOut(BaseModel):
+    """Result of ``POST /v1/play/claim``: the user's learner after the merge."""
+
+    learner_id: str
+
+
 class StudentSessionOut(BaseModel):
     """Student-safe view returned when a play session is created.
 

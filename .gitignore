@@ -1,12 +1,17 @@
 # Python / uv
 .venv/
 __pycache__/
-*.py
+*.pyc
 
 # uv may write a lock; keep it tracked, ignore caches
 .uv/
+
+# Local, machine-specific env files (templates like .env.prod stay tracked)
+.env
+.env.local
 
 vibe-coding
 .claude
 docs
 vbcd-dev
+/App

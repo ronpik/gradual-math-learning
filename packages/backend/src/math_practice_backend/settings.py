@@ -29,11 +29,17 @@ class Settings(BaseSettings):
         serve_web:                whether to mount the static web client at ``/``.
         web_dir:                  explicit path to the built web client; when
                                   ``None`` a repo-relative default is used.
+        firebase_project_id:      the Firebase project id used to verify ID
+                                  tokens (audience + issuer). ``None`` disables
+                                  the live Firebase provider (tests inject a fake).
     """
 
     model_config = SettingsConfigDict(
         env_prefix="MATH_PRACTICE_",
-        env_file=".env",
+        # Both files are optional; values in `.env.local` (machine-specific,
+        # git-ignored) override `.env`, and real environment variables override
+        # both. Missing files are ignored.
+        env_file=(".env", ".env.local"),
         extra="ignore",
     )
 
@@ -43,6 +49,7 @@ class Settings(BaseSettings):
     cors_allow_origins: list[str] = ["*"]
     serve_web: bool = True
     web_dir: str | None = None
+    firebase_project_id: str | None = "math-practice-498810"
 
 
 @lru_cache(maxsize=1)

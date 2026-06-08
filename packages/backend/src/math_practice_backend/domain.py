@@ -27,20 +27,42 @@ from .enums import Mode, SessionStatus
 
 
 @dataclass
+class User:
+    """An authenticated user account.
+
+    The id will hold the Firebase uid once auth is wired up; a :class:`Learner`
+    references it via the optional ``user_id``. NULL/None means the learner is
+    anonymous (today's behavior).
+
+    Attributes:
+        id:         the user's id (Firebase uid).
+        email:      the user's email, if known.
+        created_at: when the user was first created (aware UTC).
+    """
+
+    id: str
+    email: str | None
+    created_at: datetime
+
+
+@dataclass
 class Learner:
     """A permanent learner identity.
 
     The learner id is minted by the server on first contact and stored by the
     client (``localStorage``); it scopes all of a child's cross-session module
-    progress.
+    progress. An optional ``user_id`` links the learner to an authenticated
+    :class:`User`; ``None`` marks an anonymous learner.
 
     Attributes:
         id:         opaque learner id (uuid4 hex).
         created_at: when the learner was first created (aware UTC).
+        user_id:    the owning user's id, or ``None`` for an anonymous learner.
     """
 
     id: str
     created_at: datetime
+    user_id: str | None = None
 
 
 @dataclass

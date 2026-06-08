@@ -1,0 +1,67 @@
+# Local development infrastructure for the math-practice app.
+#
+# The only stateful infra the backend needs right now is PostgreSQL. Auth is
+# Firebase (external — no local service), and the app uses no Redis/queue/object
+# store. The backend, the CLIs, and the web client all run on the host.
+#
+# Isolation: a dedicated network (mathlearn-net) + a non-default host port
+# (5434) keep this separate from any other Postgres instances you run.
+#
+# Usage:
+#   docker compose up -d                  # start Postgres (creates the volume)
+#   docker compose --profile tools up -d  # also start Adminer (DB UI) on :8081
+#   docker compose ps                     # status
+#   docker compose down                   # stop  (data PERSISTS in the volume)
+#   docker compose down -v                # stop + DELETE the data volume
+#
+# After it is up, create the schema and run the backend (reads .env.local):
+#   uv run --package math-practice-backend alembic -c packages/backend/alembic.ini upgrade head
+#   uv run uvicorn math_practice_backend.app:app --reload
+
+name: mathlearn
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: mathlearn-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mathlearn
+      POSTGRES_PASSWORD: mathlearn
+      POSTGRES_DB: mathlearn
+    ports:
+      # host:container — override the host port with MATHLEARN_DB_PORT if 5434
+      # is taken: `MATHLEARN_DB_PORT=5455 docker compose up -d`
+      - "${MATHLEARN_DB_PORT:-5434}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - mathlearn-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mathlearn -d mathlearn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional lightweight DB admin UI. Start with: docker compose --profile tools up -d
+  # Then open http://localhost:8081  (System: PostgreSQL, Server: db, User/Pass/DB: mathlearn)
+  adminer:
+    image: adminer:4
+    container_name: mathlearn-adminer
+    restart: unless-stopped
+    ports:
+      - "${MATHLEARN_ADMINER_PORT:-8081}:8080"
+    networks:
+      - mathlearn-net
+    depends_on:
+      - db
+    profiles:
+      - tools
+
+networks:
+  mathlearn-net:
+    name: mathlearn-net
+
+volumes:
+  pgdata:
+    name: mathlearn-pgdata
