@@ -45,12 +45,40 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
 
+class UserRow(Base):
+    """ORM row for an authenticated user account (``users`` table).
+
+    The primary key will hold the Firebase uid once auth is wired up; today the
+    table is created but unpopulated (anonymous learners carry a NULL
+    ``user_id``). ``email`` is optional and ``created_at`` is timezone-aware UTC.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class LearnerRow(Base):
-    """ORM row for a permanent learner identity (``learners`` table)."""
+    """ORM row for a permanent learner identity (``learners`` table).
+
+    ``user_id`` is a nullable foreign key to ``users.id``: a NULL value marks an
+    anonymous learner (today's behavior). ``ON DELETE SET NULL`` keeps the
+    learner (and all its progress) when an owning user is removed.
+    """
 
     __tablename__ = "learners"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

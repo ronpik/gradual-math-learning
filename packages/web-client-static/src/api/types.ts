@@ -81,6 +81,17 @@ export interface Summary {
   levels: LevelProgress[];
 }
 
+/** Authenticated identity — `GET /v1/play/me`. */
+export interface Me {
+  learner_id: string;
+  email: string | null;
+}
+
+/** Result of merging an anonymous learner — `POST /v1/play/claim`. */
+export interface ClaimResult {
+  learner_id: string;
+}
+
 /** Aggregate stats — `GET /v1/play/sessions/{sid}/stats`. */
 export interface StudentStats {
   questions_done: number;

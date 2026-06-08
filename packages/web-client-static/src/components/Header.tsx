@@ -25,6 +25,10 @@ export function Header({
   onToggleSound,
   onOpenStats,
   onQuit,
+  email,
+  signedIn,
+  onSignIn,
+  onSignOut,
 }: {
   done: number;
   percent: number;
@@ -37,6 +41,10 @@ export function Header({
   onToggleSound: () => void;
   onOpenStats: () => void;
   onQuit: () => void;
+  email: string | null;
+  signedIn: boolean;
+  onSignIn: () => void;
+  onSignOut: () => void;
 }): JSX.Element {
   let hud: JSX.Element | null = null;
   if (mode === "fastest_20" && targetCount !== null) {
@@ -104,6 +112,31 @@ export function Header({
         >
           🏡
         </button>
+
+        {signedIn ? (
+          <div className="account">
+            {email ? (
+              <span className="account__email" title={email}>
+                {email}
+              </span>
+            ) : null}
+            <button
+              type="button"
+              className="account__btn"
+              onClick={onSignOut}
+            >
+              Sign out
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="account__btn account__btn--primary"
+            onClick={onSignIn}
+          >
+            Sign in
+          </button>
+        )}
       </div>
     </header>
   );

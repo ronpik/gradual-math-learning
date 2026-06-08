@@ -29,6 +29,9 @@ class Settings(BaseSettings):
         serve_web:                whether to mount the static web client at ``/``.
         web_dir:                  explicit path to the built web client; when
                                   ``None`` a repo-relative default is used.
+        firebase_project_id:      the Firebase project id used to verify ID
+                                  tokens (audience + issuer). ``None`` disables
+                                  the live Firebase provider (tests inject a fake).
     """
 
     model_config = SettingsConfigDict(
@@ -43,6 +46,7 @@ class Settings(BaseSettings):
     cors_allow_origins: list[str] = ["*"]
     serve_web: bool = True
     web_dir: str | None = None
+    firebase_project_id: str | None = "math-practice-498810"
 
 
 @lru_cache(maxsize=1)

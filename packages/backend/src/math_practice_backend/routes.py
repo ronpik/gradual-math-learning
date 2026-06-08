@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, status
 from math_practice import ExerciseMastery
 
 from . import mappers
-from .dependencies import get_repository, get_service
+from .dependencies import get_repository, get_service, get_stats_service
 from .domain import SessionAggregate, TrialRecord
 from .enums import Mode
 from .errors import UnknownMode
@@ -34,7 +34,7 @@ from .schemas import (
     StatsOut,
     TrialOut,
 )
-from .service import Progress, SessionService
+from .service import Progress, SessionService, StatsService
 
 #: Defaults applied when the admin create request omits a module / mode, for
 #: back-compat with the v1 admin surface (the original ``add_10`` endless run).
@@ -196,9 +196,11 @@ async def submit_answer(
 async def get_stats(
     sid: str,
     service: SessionService = Depends(get_service),
+    stats_service: StatsService = Depends(get_stats_service),
 ) -> StatsOut:
     """Return aggregate session statistics with a recent-trials tail."""
-    result = service.get_stats(sid)
+    agg = service.get_session(sid)
+    result = stats_service.get_stats(agg)
     progress = _progress_out(result.progress)
     recent = [
         mappers.trial_to_out(

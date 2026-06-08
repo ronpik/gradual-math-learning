@@ -18,11 +18,15 @@ import { AnimatePresence, motion } from "framer-motion";
 
 import {
   ApiError,
+  claimAnonymous,
   createSession,
+  getMe,
   getNext,
   getSummary,
   listModes,
   listModules,
+  setAuthToken,
+  setTokenRefresher,
   submitAnswer,
 } from "./api/client";
 import type {
@@ -39,6 +43,13 @@ import {
   saveRun,
   type RunContext,
 } from "./session";
+import {
+  getIdToken,
+  observeAuth,
+  signOutUser,
+  type User,
+} from "./firebase";
+import { AuthModal } from "./components/AuthModal";
 import {
   playCorrect,
   playWrong,
@@ -122,6 +133,13 @@ export default function App(): JSX.Element {
   const [statsOpen, setStatsOpen] = useState(false);
   const [soundOn, setSoundOn] = useState<boolean>(() => readSoundPref());
 
+  // Auth state. `signedIn` reflects a live Firebase user; `accountEmail` is the
+  // user's email (for the Header chip). The AuthModal is opened from the
+  // Header / menu account control.
+  const [signedIn, setSignedIn] = useState(false);
+  const [accountEmail, setAccountEmail] = useState<string | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+
   // Timing: set when an exercise is shown, read at submit.
   const shownAtRef = useRef<number>(0);
   // Auto-advance timer handle.
@@ -130,6 +148,9 @@ export default function App(): JSX.Element {
   const submittingRef = useRef(false);
   // Guards against double-navigation to the summary (finished / 409 / expiry).
   const endingRef = useRef(false);
+  // Latest learner id, readable from the auth callback without re-subscribing.
+  const learnerIdRef = useRef<string | null>(learnerId);
+  learnerIdRef.current = learnerId;
 
   const clearAdvanceTimer = useCallback(() => {
     if (advanceTimerRef.current !== null) {
@@ -209,13 +230,21 @@ export default function App(): JSX.Element {
       setMenuBusy(true);
       setMenuError(null);
       try {
+        // When signed in, send `null` so the server resolves the user's
+        // account learner (and ignores the body) per the auth wire contract.
         const session = await createSession({
-          learnerId,
+          learnerId: signedIn ? null : learnerId,
           moduleId,
           mode: modeId,
         });
-        saveLearnerId(session.learner_id);
-        setLearnerId(session.learner_id);
+        if (signedIn) {
+          // Track the user's learner in memory, but DON'T overwrite the
+          // anonymous learner key in localStorage — it must survive sign-out.
+          setLearnerId(session.learner_id);
+        } else {
+          saveLearnerId(session.learner_id);
+          setLearnerId(session.learner_id);
+        }
         const ctx: RunContext = {
           sessionId: session.session_id,
           moduleId: session.module_id,
@@ -246,7 +275,7 @@ export default function App(): JSX.Element {
         }
       }
     },
-    [clearAdvanceTimer, learnerId, presentExercise],
+    [clearAdvanceTimer, learnerId, presentExercise, signedIn],
   );
 
   // Boot: resume a stored run, else show the menu.
@@ -296,6 +325,122 @@ export default function App(): JSX.Element {
 
   // Tidy the advance timer on unmount.
   useEffect(() => clearAdvanceTimer, [clearAdvanceTimer]);
+
+  /**
+   * Auth flow. Subscribe once to Firebase auth-state changes:
+   *
+   *  - Signed in: fetch an ID token -> `setAuthToken`; merge the current
+   *    anonymous learner into the user's account (`claimAnonymous`, best-effort,
+   *    once); then `getMe()` and switch the active learner to the user's
+   *    learner. We clear any in-flight anonymous run and return to the menu so
+   *    play resumes cleanly as the signed-in user.
+   *  - Signed out: `setAuthToken(null)` and revert to the persisted anonymous
+   *    learner id (the pre-login behaviour).
+   *
+   * A periodic refresh keeps the ~1h token fresh; 401s are also recovered
+   * lazily via `getIdToken(true)` at the call sites that need it.
+   */
+  useEffect(() => {
+    let alive = true;
+    let refreshTimer: number | null = null;
+
+    // A 401 on an authed request triggers a single forced token refresh + retry.
+    setTokenRefresher(() => getIdToken(true));
+
+    const clearRefresh = (): void => {
+      if (refreshTimer !== null) {
+        window.clearInterval(refreshTimer);
+        refreshTimer = null;
+      }
+    };
+
+    const unsubscribe = observeAuth((user: User | null) => {
+      void (async () => {
+        if (!alive) {
+          return;
+        }
+        if (!user) {
+          // Signed out -> anonymous play.
+          clearRefresh();
+          setAuthToken(null);
+          setSignedIn(false);
+          setAccountEmail(null);
+          setLearnerId(readLearnerId());
+          return;
+        }
+
+        // Signed in -> attach token, merge, adopt the user's learner.
+        const token = await getIdToken();
+        if (!alive) {
+          return;
+        }
+        setAuthToken(token);
+
+        // Best-effort one-shot merge of the anonymous learner.
+        const anon = learnerIdRef.current;
+        if (anon) {
+          try {
+            await claimAnonymous(anon);
+          } catch {
+            // Non-fatal: a failed merge must not block sign-in.
+          }
+        }
+        if (!alive) {
+          return;
+        }
+
+        try {
+          const me = await getMe();
+          if (!alive) {
+            return;
+          }
+          // Switch the active learner to the user's account learner.
+          clearAdvanceTimer();
+          clearRun();
+          setRun(null);
+          setExercise(null);
+          setSummary(null);
+          endingRef.current = false;
+          saveLearnerId(me.learner_id);
+          setLearnerId(me.learner_id);
+          setAccountEmail(me.email ?? user.email ?? null);
+          setSignedIn(true);
+          // Start fresh as the user.
+          void goToMenu();
+        } catch {
+          // If /me fails we still consider the user signed in for UI purposes.
+          if (alive) {
+            setAccountEmail(user.email ?? null);
+            setSignedIn(true);
+          }
+        }
+
+        // Keep the token fresh (~every 50 min).
+        clearRefresh();
+        refreshTimer = window.setInterval(() => {
+          void (async () => {
+            const fresh = await getIdToken(true);
+            if (alive) {
+              setAuthToken(fresh);
+            }
+          })();
+        }, 50 * 60 * 1000);
+      })();
+    });
+
+    return () => {
+      alive = false;
+      clearRefresh();
+      setTokenRefresher(null);
+      unsubscribe();
+    };
+    // Subscribe once; the callback reads the latest learner via the ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSignOut = useCallback(() => {
+    void signOutUser();
+  }, []);
 
   /** Draw the next exercise; route 409 -> summary, gone -> menu. */
   const loadNext = useCallback(
@@ -446,6 +591,35 @@ export default function App(): JSX.Element {
         <div className="meadow__hill meadow__hill--front" />
       </div>
 
+      {view !== "playing" && (
+        <div className="account-bar">
+          {signedIn ? (
+            <div className="account">
+              {accountEmail ? (
+                <span className="account__email" title={accountEmail}>
+                  {accountEmail}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                className="account__btn"
+                onClick={handleSignOut}
+              >
+                Sign out
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="account__btn account__btn--primary"
+              onClick={() => setAuthOpen(true)}
+            >
+              Sign in
+            </button>
+          )}
+        </div>
+      )}
+
       <main className="app">
         {view === "loading" && (
           <div className="banner" role="status" aria-live="polite">
@@ -509,6 +683,10 @@ export default function App(): JSX.Element {
                 onToggleSound={handleToggleSound}
                 onOpenStats={() => setStatsOpen(true)}
                 onQuit={handleQuit}
+                email={accountEmail}
+                signedIn={signedIn}
+                onSignIn={() => setAuthOpen(true)}
+                onSignOut={handleSignOut}
               />
             </motion.div>
 
@@ -557,6 +735,10 @@ export default function App(): JSX.Element {
             onClose={() => setStatsOpen(false)}
           />
         )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {authOpen && <AuthModal onClose={() => setAuthOpen(false)} />}
       </AnimatePresence>
     </>
   );
