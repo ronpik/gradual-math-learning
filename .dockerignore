@@ -1,0 +1,20 @@
+# Keep the Docker build context small and correct.
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+
+# JS client artifacts (not needed to build the backend image)
+packages/web-client-static/node_modules
+packages/web-client-static/dist
+
+# Env files never belong in the image (passed at runtime via --env-file).
+# Kept in git as templates, but excluded from the build context.
+**/.env*
+.DS_Store
+.idea
+.vscode
+
+# Docs vault (git-ignored symlink) and generated figures
+docs
