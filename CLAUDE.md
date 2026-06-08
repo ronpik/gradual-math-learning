@@ -126,3 +126,22 @@ run via uvicorn) — a bare `TestClient(app)` skips lifespan and yields
 - Changing engine behaviour means changing `EngineConfig` defaults and/or a single
   component; the four components and the front-ends stay untouched thanks to the
   facade + `EngineState` seam.
+
+## Related agent instructions (AGENTS.md)
+
+Vendor-neutral `AGENTS.md` files (read by Codex/Cursor/Copilot/etc.; this
+`CLAUDE.md` is the Claude-native root) carry per-scope context. Consult the
+relevant one when working in that area:
+
+- `packages/common-lib/AGENTS.md` — engine library; stdlib-only rule; the
+  `EngineState` snapshot/restore seam; plain-assert test scripts.
+- `packages/backend/AGENTS.md` — layering & boundaries, the two API surfaces,
+  identity/auth, storage; links to the two below.
+- `packages/backend/migrations/AGENTS.md` — Alembic workflow; dialect-portable
+  migration types; single-baseline regeneration caveat.
+- `packages/backend/tests/AGENTS.md` — Postgres-only testcontainers harness,
+  savepoint-rollback isolation, fixtures, DI test seam.
+- `packages/cli/AGENTS.md` — offline direct-lib CLI.
+- `packages/client/AGENTS.md` — httpx CLI over `/v1/play` (no engine import).
+- `packages/web-client-static/AGENTS.md` — React/Vite SPA; play-only; Firebase;
+  student-safe rendering rules.
