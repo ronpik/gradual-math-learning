@@ -36,7 +36,10 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="MATH_PRACTICE_",
-        env_file=".env",
+        # Both files are optional; values in `.env.local` (machine-specific,
+        # git-ignored) override `.env`, and real environment variables override
+        # both. Missing files are ignored.
+        env_file=(".env", ".env.local"),
         extra="ignore",
     )
 

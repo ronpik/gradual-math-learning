@@ -6,6 +6,10 @@ __pycache__/
 # uv may write a lock; keep it tracked, ignore caches
 .uv/
 
+# Local, machine-specific env files (templates like .env.prod stay tracked)
+.env
+.env.local
+
 vibe-coding
 .claude
 docs
