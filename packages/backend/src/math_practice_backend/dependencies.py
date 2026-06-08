@@ -73,6 +73,11 @@ class _AppState:
 #: Lazily-populated container for the application's shared singletons.
 _state = _AppState()
 
+#: Test seam: when set (by the test harness via
+#: :func:`set_session_factory_override`), every provider routes through this
+#: session factory instead of the module default. ``None`` in production.
+_override_session_factory: sessionmaker | None = None
+
 
 def get_engine() -> Engine:
     """Return the process-wide SQLAlchemy engine (singleton from :mod:`db`)."""
@@ -80,8 +85,54 @@ def get_engine() -> Engine:
 
 
 def get_session_factory() -> sessionmaker:
-    """Return the process-wide session factory (singleton from :mod:`db`)."""
+    """Return the session factory the repositories should use.
+
+    Returns the test override when one is installed (see
+    :func:`set_session_factory_override`), else the process-wide default
+    singleton from :mod:`db`. Behaviour is identical to the bare default when no
+    override is set, so production is untouched.
+    """
+    if _override_session_factory is not None:
+        return _override_session_factory
     return default_session_factory
+
+
+def reset_state() -> None:
+    """Clear every shared singleton so the next provider call rebuilds it.
+
+    Used by the test harness between tests; harmless in production (the
+    singletons simply repopulate lazily).
+    """
+    _state.repository = None
+    _state.learner_repository = None
+    _state.user_repository = None
+    _state.progress_service = None
+    _state.stats_service = None
+    _state.service = None
+    _state.clock = None
+    _state.auth_provider = None
+    _state.identity_service = None
+
+
+def set_session_factory_override(factory: sessionmaker | None) -> None:
+    """Install (or clear) a test session-factory override.
+
+    Because the providers call :func:`get_session_factory` *directly* (not via
+    FastAPI ``Depends``), a ``dependency_overrides`` entry is not enough to
+    redirect the repositories. This sets a module-level override AND resets every
+    cached singleton built from the factory so the next ``get_repository`` /
+    ``get_service`` / ``get_*`` call rebuilds against the override.
+
+    Pass ``None`` to remove the override and reset the singletons back to the
+    module default.
+
+    Args:
+        factory: the per-test session factory to route all DB access through, or
+            ``None`` to restore the default.
+    """
+    global _override_session_factory
+    _override_session_factory = factory
+    reset_state()
 
 
 def get_clock() -> Clock:

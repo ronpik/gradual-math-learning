@@ -1,16 +1,17 @@
 """Plain-assert verification of :class:`SessionService` across practice modes.
 
-Drives the service directly (no HTTP) against an isolated in-memory SQLite
-database and a controllable :class:`FakeClock`, exercising the four locked
-product decisions that live in the service: per-mode stop rules
-(``FASTEST_20`` / ``THREE_MINUTE`` / ``ENDLESS``), op-aware server-side grading,
-resume from written-through :class:`~math_practice_backend.domain.ModuleProgress`,
-and the dual audit log.
+Drives the service directly (no HTTP) against the isolated, rolled-back Postgres
+transaction provided by the ``session_factory`` fixture and a controllable
+:class:`FakeClock`, exercising the four locked product decisions that live in
+the service: per-mode stop rules (``FASTEST_20`` / ``THREE_MINUTE`` /
+``ENDLESS``), op-aware server-side grading, resume from written-through
+:class:`~math_practice_backend.domain.ModuleProgress`, and the dual audit log.
 
-Run directly (no pytest):
+Run under pytest (Postgres-only; needs Docker or
+``MATH_PRACTICE_TEST_DATABASE_URL``):
 
-    uv run --package math-practice-backend \
-        python packages/backend/tests/test_service_modes.py
+    uv run --package math-practice-backend --extra dev --extra postgres \
+        python -m pytest packages/backend/tests/test_service_modes.py -q
 """
 
 from __future__ import annotations
@@ -18,13 +19,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from sqlalchemy import create_engine
+import pytest
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from math_practice import PracticeEngine, get_module
 
-from math_practice_backend.db import Base
 from math_practice_backend.enums import Mode, SessionStatus
 from math_practice_backend.errors import SessionComplete
 from math_practice_backend.repositories import (
@@ -69,24 +68,18 @@ class _Services(NamedTuple):
     clock: FakeClock
 
 
-def _build_service() -> _Services:
-    """Build the isolated split services over a fresh in-memory SQLite database.
+@pytest.fixture()
+def services(session_factory: sessionmaker) -> _Services:
+    """Build the split services over the per-test (rolled-back) Postgres DB.
 
     Returns the session service, the read-only stats service, the progress
     service, the session repository (for direct audit-log reads), the learner
-    repository (for direct progress reads), and the fake clock.
+    repository (for direct progress reads), and the fake clock. Isolation +
+    schema come from the ``session_factory`` fixture, so no per-test setup or
+    teardown is needed here.
     """
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        future=True,
-    )
-    Base.metadata.create_all(engine)
-    sf = sessionmaker(bind=engine, future=True)
-
-    repo = SqlAlchemySessionRepository(sf)
-    learner_repo = SqlAlchemyLearnerRepository(sf)
+    repo = SqlAlchemySessionRepository(session_factory)
+    learner_repo = SqlAlchemyLearnerRepository(session_factory)
     clock = FakeClock(datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc))
     progress_service = ProgressService(learner_repo)
     stats_service = StatsService(repo)
@@ -108,10 +101,9 @@ def _expected(op: str, a: int, b: int) -> int:
     return a + b if op == "+" else a - b
 
 
-def test_fastest_20_completes_after_20() -> None:
+def test_fastest_20_completes_after_20(services: _Services) -> None:
     """FASTEST_20 stops after exactly 20 answers; the 21st draw is rejected."""
-    svc = _build_service()
-    service, stats = svc.session, svc.stats
+    service, stats = services.session, services.stats
 
     agg = service.create_session(None, "add_10", Mode.FASTEST_20)
     sid = agg.id
@@ -146,10 +138,9 @@ def test_fastest_20_completes_after_20() -> None:
     assert summary.questions_done == 20
 
 
-def test_three_minute_deadline_rejects_late_answer() -> None:
+def test_three_minute_deadline_rejects_late_answer(services: _Services) -> None:
     """THREE_MINUTE closes on the server deadline; in-window answers count."""
-    svc = _build_service()
-    service, stats, clock = svc.session, svc.stats, svc.clock
+    service, stats, clock = services.session, services.stats, services.clock
 
     agg = service.create_session(None, "sub_10", Mode.THREE_MINUTE)
     sid = agg.id
@@ -194,10 +185,9 @@ def test_three_minute_deadline_rejects_late_answer() -> None:
     assert summary.questions_done == 2
 
 
-def test_endless_never_completes() -> None:
+def test_endless_never_completes(services: _Services) -> None:
     """ENDLESS keeps drawing exercises no matter how many are answered."""
-    svc = _build_service()
-    service, stats = svc.session, svc.stats
+    service, stats = services.session, services.stats
 
     agg = service.create_session(None, "add_10", Mode.ENDLESS)
     sid = agg.id
@@ -219,10 +209,9 @@ def test_endless_never_completes() -> None:
     assert "accuracy" in summary.headline
 
 
-def test_resume_seeds_progress() -> None:
+def test_resume_seeds_progress(services: _Services) -> None:
     """A second session for the same (learner, module) resumes raised θ."""
-    svc = _build_service()
-    service, learner_repo = svc.session, svc.learner_repo
+    service, learner_repo = services.session, services.learner_repo
 
     # First run: answer several correctly to raise θ above cold-start.
     first = service.create_session(None, "add_20", Mode.FASTEST_20)
@@ -258,9 +247,9 @@ def test_resume_seeds_progress() -> None:
     assert second.engine_state.theta != cold_theta
 
 
-def test_op_aware_grading() -> None:
+def test_op_aware_grading(services: _Services) -> None:
     """Subtraction grades ``a - b`` correct and ``a + b`` wrong."""
-    service = _build_service().session
+    service = services.session
 
     agg = service.create_session(None, "sub_10", Mode.ENDLESS)
     sid = agg.id
@@ -284,10 +273,9 @@ def test_op_aware_grading() -> None:
     )
 
 
-def test_audit_log_one_row_per_answer() -> None:
+def test_audit_log_one_row_per_answer(services: _Services) -> None:
     """The clean audit log gets one row per answer with the right op + level."""
-    svc = _build_service()
-    service, repo = svc.session, svc.repo
+    service, repo = services.session, services.repo
 
     agg = service.create_session(None, "sub_10", Mode.ENDLESS)
     sid = agg.id
@@ -307,18 +295,3 @@ def test_audit_log_one_row_per_answer() -> None:
         assert row.a - row.b == row.given_answer, (
             "audit row should record the op-aware correct answer we submitted"
         )
-
-
-def main() -> None:
-    """Run every service-mode assertion and print OK on success."""
-    test_fastest_20_completes_after_20()
-    test_three_minute_deadline_rejects_late_answer()
-    test_endless_never_completes()
-    test_resume_seeds_progress()
-    test_op_aware_grading()
-    test_audit_log_one_row_per_answer()
-    print("OK - test_service_modes")
-
-
-if __name__ == "__main__":
-    main()

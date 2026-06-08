@@ -26,10 +26,17 @@ uv run math-practice                             # interactive offline CLI (dire
 uv run math-practice-client [--auto N --seed S]  # HTTP-client CLI (needs a running backend)
 uv run uvicorn math_practice_backend.app:app --reload   # run the API
 
-# Engine tests are plain-assert scripts (NOT pytest), run directly:
+# Engine tests are plain-assert scripts (NOT pytest), run directly (no DB):
 uv run --package math-practice python packages/common-lib/tests/test_smoke.py
 uv run --package math-practice python packages/common-lib/tests/test_state.py
-# (pytest is a backend dev-extra; there are no committed pytest suites yet.)
+
+# Backend tests are pytest and POSTGRES-ONLY (not SQLite): a testcontainers
+# harness spins an ephemeral postgres:16-alpine (tmpfs + durability off) once
+# per session, runs `alembic upgrade head`, and isolates each test in a
+# rolled-back transaction. Needs Docker running (or set
+# MATH_PRACTICE_TEST_DATABASE_URL to a reachable Postgres to skip the container):
+uv run --package math-practice-backend --extra dev --extra postgres \
+    python -m pytest packages/backend/tests -q
 
 # Web client (separate JS toolchain; needs Node 20+ / npm)
 cd packages/web-client-static
@@ -89,7 +96,13 @@ routes*.py (Pydantic schemas) → mappers.py → domain.py (dataclasses)
 **ephemeral** and the in-memory store is **not shared across processes**, so the
 server must run **single-worker** until pointed at file SQLite/Postgres via
 `MATH_PRACTICE_DATABASE_URL`. Settings use the `MATH_PRACTICE_` env prefix
-(`SERVE_WEB`, `WEB_DIR`, `CORS_ALLOW_ORIGINS`, `SESSION_TTL_HOURS`, ...).
+(`SERVE_WEB`, `WEB_DIR`, `CORS_ALLOW_ORIGINS`, `SESSION_TTL_HOURS`, ...). Note the
+**backend tests do NOT use SQLite** — they run against a real Postgres (the
+production target) via testcontainers; the `tests/conftest.py` harness installs a
+per-test session-factory override through `dependencies.set_session_factory_override`
+(the providers call `get_session_factory()` directly, so a FastAPI
+`dependency_overrides` on it alone would not redirect the repositories). The psycopg
+v3 driver is used, so test URLs are `postgresql+psycopg://`.
 
 **Lifespan gotcha:** tables are created and the static `dist/` is mounted in the
 FastAPI **lifespan**. So `TestClient(app)` must use the `with` context manager (or

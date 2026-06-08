@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["httpx", "pytest"]
+dev = ["httpx", "pytest", "testcontainers"]
 postgres = ["psycopg[binary]"]
 
 [build-system]
