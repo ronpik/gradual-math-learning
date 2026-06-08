@@ -32,17 +32,22 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
+    Enum,
     Float,
     ForeignKey,
     Index,
     Integer,
     String,
+    Uuid,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .enums import Mode, SessionStatus
 
 
 class UserRow(Base):
@@ -56,7 +61,9 @@ class UserRow(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    email: Mapped[str | None] = mapped_column(
+        String().with_variant(postgresql.CITEXT(), "postgresql"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -72,7 +79,7 @@ class LearnerRow(Base):
 
     __tablename__ = "learners"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)
     user_id: Mapped[str | None] = mapped_column(
         String,
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -97,14 +104,16 @@ class LearnerModuleProgressRow(Base):
     __tablename__ = "learner_module_progress"
 
     learner_id: Mapped[str] = mapped_column(
-        String,
+        Uuid(as_uuid=False),
         ForeignKey("learners.id", ondelete="CASCADE"),
         primary_key=True,
     )
     module_id: Mapped[str] = mapped_column(String, primary_key=True)
 
     theta: Mapped[float] = mapped_column(Float, nullable=False)
-    mastery_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    mastery_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -124,16 +133,30 @@ class SessionRow(Base):
 
     __tablename__ = "sessions"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)
     learner_id: Mapped[str] = mapped_column(
-        String,
+        Uuid(as_uuid=False),
         ForeignKey("learners.id"),
         nullable=False,
         index=True,
     )
     module_id: Mapped[str] = mapped_column(String, nullable=False)
-    mode: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[str] = mapped_column(String, nullable=False)
+    mode: Mapped[Mode] = mapped_column(
+        Enum(
+            Mode,
+            name="practice_mode",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+    )
+    status: Mapped[SessionStatus] = mapped_column(
+        Enum(
+            SessionStatus,
+            name="session_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime] = mapped_column(
@@ -153,7 +176,9 @@ class SessionRow(Base):
     target_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     theta: Mapped[float] = mapped_column(Float, nullable=False)
-    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=False
+    )
 
     last_shown_a: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_shown_b: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -194,7 +219,7 @@ class MasteryRow(Base):
     __tablename__ = "session_mastery"
 
     session_id: Mapped[str] = mapped_column(
-        String,
+        Uuid(as_uuid=False),
         ForeignKey("sessions.id", ondelete="CASCADE"),
         primary_key=True,
     )
@@ -213,9 +238,13 @@ class TrialRow(Base):
 
     __tablename__ = "trials"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     session_id: Mapped[str] = mapped_column(
-        String,
+        Uuid(as_uuid=False),
         ForeignKey("sessions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
@@ -250,9 +279,13 @@ class SessionExerciseRow(Base):
 
     __tablename__ = "session_exercises"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     session_id: Mapped[str] = mapped_column(
-        String,
+        Uuid(as_uuid=False),
         ForeignKey("sessions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,

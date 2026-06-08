@@ -764,7 +764,7 @@ class SessionService:
 
         mode_strategy = get_mode(mode)
         agg = SessionAggregate(
-            id=uuid.uuid4().hex,
+            id=str(uuid.uuid4()),
             learner_id=learner.id,
             module_id=module_id,
             mode=mode,

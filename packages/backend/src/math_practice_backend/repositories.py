@@ -29,6 +29,7 @@ import abc
 import dataclasses
 from datetime import datetime, timezone
 from typing import Any
+import uuid
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
@@ -180,8 +181,8 @@ class SqlAlchemySessionRepository(SessionRepository):
         state = agg.engine_state
         row.learner_id = agg.learner_id
         row.module_id = agg.module_id
-        row.mode = agg.mode.value
-        row.status = agg.status.value
+        row.mode = agg.mode
+        row.status = agg.status
         row.created_at = agg.created_at
         row.started_at = agg.started_at
         row.ended_at = agg.ended_at
@@ -267,8 +268,8 @@ class SqlAlchemySessionRepository(SessionRepository):
             id=row.id,
             learner_id=row.learner_id,
             module_id=row.module_id,
-            mode=Mode(row.mode),
-            status=SessionStatus(row.status),
+            mode=row.mode,
+            status=row.status,
             created_at=_as_utc(row.created_at),
             started_at=_as_utc(row.started_at),
             ended_at=_as_utc(row.ended_at) if row.ended_at is not None else None,
@@ -490,8 +491,8 @@ class SqlAlchemySessionRepository(SessionRepository):
                 select(SessionRow)
                 .where(SessionRow.learner_id == learner_id)
                 .where(SessionRow.module_id == module_id)
-                .where(SessionRow.mode == mode.value)
-                .where(SessionRow.status == SessionStatus.COMPLETED.value)
+                .where(SessionRow.mode == mode)
+                .where(SessionRow.status == SessionStatus.COMPLETED)
             )
             if mode is Mode.FASTEST_20:
                 total = db.scalar(
@@ -701,12 +702,23 @@ class SqlAlchemyLearnerRepository(LearnerRepository):
     def get_or_create(self, learner_id: str | None, now: datetime) -> Learner:
         """Return an existing learner, or create one stamped at ``now``."""
         created_at = _as_utc(now)
+        # A client may supply a non-UUID learner_id (e.g. a stale or hand-rolled
+        # value in an anonymous create body). With a native Uuid column a lookup
+        # on such a value raises, so treat anything that is not a valid UUID as a
+        # request to mint a fresh learner rather than 500-ing.
+        valid_id: str | None = None
+        if learner_id is not None:
+            try:
+                uuid.UUID(learner_id)
+                valid_id = learner_id
+            except (ValueError, AttributeError, TypeError):
+                valid_id = None
         with self._session_factory() as db:
-            if learner_id is not None:
-                row = db.get(LearnerRow, learner_id)
+            if valid_id is not None:
+                row = db.get(LearnerRow, valid_id)
                 if row is not None:
                     return self._learner_row_to_domain(row)
-            new_id = learner_id if learner_id is not None else uuid4().hex
+            new_id = valid_id if valid_id is not None else str(uuid4())
             row = LearnerRow(id=new_id, created_at=created_at)
             db.add(row)
             db.commit()
@@ -785,7 +797,7 @@ class SqlAlchemyLearnerRepository(LearnerRepository):
     ) -> Learner:
         """Mint a new learner already owned by ``user_id`` (atomic)."""
         created_at = _as_utc(now)
-        new_id = uuid4().hex
+        new_id = str(uuid4())
         with self._session_factory() as db:
             db.add(
                 LearnerRow(
